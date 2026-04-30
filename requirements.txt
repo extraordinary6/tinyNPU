@@ -1,0 +1,3 @@
+cocotb==1.8.1
+numpy<1.22
+pytest<7.5

@@ -1,0 +1,31 @@
+# Cocotb / Icarus simulation artefacts
+sim_build/
+results.xml
+*.vvp
+*.fst
+*.vcd
+*.fst.hier
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Verilator scratch
+obj_dir/
+
+# Editor / OS
+*.bak
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local overrides (per-machine config; not for VCS)
+Makefile.local
+.env
+
+# Claude Code metadata (per-user agent state, not part of the project)
+.claude/
