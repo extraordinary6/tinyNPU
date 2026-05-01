@@ -1,6 +1,6 @@
 // top_harness.sv
-// Wraps tinyNPU_top together with three sram_wrapper instances (IFM/W/OFM)
-// and exposes backdoor write ports for IFM/W and a backdoor read port for
+// Wraps tinyNPU_top together with four sram_wrapper instances (IFM/W/BIAS/OFM)
+// and exposes backdoor write ports for IFM/W/BIAS and a backdoor read port for
 // OFM. Cocotb pre-loads the matrices through the backdoor ports, kicks off
 // the engine through APB, then reads OFM SRAM through the backdoor.
 
@@ -35,6 +35,11 @@ module top_harness #(
     input  logic [ADDR_W-1:0]             bd_w_addr,
     input  logic [ROWS*COLS*A_W-1:0]      bd_w_wdata,
 
+    // BIAS backdoor write port.
+    input  logic                          bd_bias_we,
+    input  logic [ADDR_W-1:0]             bd_bias_addr,
+    input  logic [COLS*P_W-1:0]           bd_bias_wdata,
+
     // OFM backdoor read port.
     input  logic                          bd_ofm_re,
     input  logic [ADDR_W-1:0]             bd_ofm_addr,
@@ -50,6 +55,10 @@ module top_harness #(
     logic [ADDR_W-1:0]          top_w_addr;
     logic [ROWS*COLS*A_W-1:0]   top_w_rdata;
 
+    logic                       top_bias_en;
+    logic [ADDR_W-1:0]          top_bias_addr;
+    logic [COLS*P_W-1:0]        top_bias_rdata;
+
     logic                       top_ofm_we;
     logic [ADDR_W-1:0]          top_ofm_addr;
     logic [COLS*O_W-1:0]        top_ofm_wdata;
@@ -63,25 +72,28 @@ module top_harness #(
         .ADDR_W(ADDR_W),
         .M_W   (M_W)
     ) u_dut (
-        .pclk           (pclk),
-        .presetn        (presetn),
-        .psel           (psel),
-        .penable        (penable),
-        .pwrite         (pwrite),
-        .paddr          (paddr),
-        .pwdata         (pwdata),
-        .prdata         (prdata),
-        .pready         (pready),
-        .pslverr        (pslverr),
-        .ifm_sram_en    (top_ifm_en),
-        .ifm_sram_addr  (top_ifm_addr),
-        .ifm_sram_rdata (top_ifm_rdata),
-        .w_sram_en      (top_w_en),
-        .w_sram_addr    (top_w_addr),
-        .w_sram_rdata   (top_w_rdata),
-        .ofm_sram_we    (top_ofm_we),
-        .ofm_sram_addr  (top_ofm_addr),
-        .ofm_sram_wdata (top_ofm_wdata)
+        .pclk            (pclk),
+        .presetn         (presetn),
+        .psel            (psel),
+        .penable         (penable),
+        .pwrite          (pwrite),
+        .paddr           (paddr),
+        .pwdata          (pwdata),
+        .prdata          (prdata),
+        .pready          (pready),
+        .pslverr         (pslverr),
+        .ifm_sram_en     (top_ifm_en),
+        .ifm_sram_addr   (top_ifm_addr),
+        .ifm_sram_rdata  (top_ifm_rdata),
+        .w_sram_en       (top_w_en),
+        .w_sram_addr     (top_w_addr),
+        .w_sram_rdata    (top_w_rdata),
+        .bias_sram_en    (top_bias_en),
+        .bias_sram_addr  (top_bias_addr),
+        .bias_sram_rdata (top_bias_rdata),
+        .ofm_sram_we     (top_ofm_we),
+        .ofm_sram_addr   (top_ofm_addr),
+        .ofm_sram_wdata  (top_ofm_wdata)
     );
 
     // ---------------- IFM SRAM (mux backdoor write vs top read) ----------------
@@ -130,6 +142,30 @@ module top_harness #(
         .addr  (w_addr),
         .wdata (w_wdata),
         .rdata (top_w_rdata)
+    );
+
+    // ---------------- BIAS SRAM ----------------
+    logic                  bs_en;
+    logic                  bs_we;
+    logic [ADDR_W-1:0]     bs_addr;
+    logic [COLS*P_W-1:0]   bs_wdata;
+
+    assign bs_en    = bd_bias_we ? 1'b1         : top_bias_en;
+    assign bs_we    = bd_bias_we;
+    assign bs_addr  = bd_bias_we ? bd_bias_addr : top_bias_addr;
+    assign bs_wdata = bd_bias_wdata;
+
+    sram_wrapper #(
+        .DEPTH (1 << ADDR_W),
+        .DATA_W(COLS*P_W),
+        .ADDR_W(ADDR_W)
+    ) u_bias_sram (
+        .clk   (pclk),
+        .en    (bs_en),
+        .we    (bs_we),
+        .addr  (bs_addr),
+        .wdata (bs_wdata),
+        .rdata (top_bias_rdata)
     );
 
     // ---------------- OFM SRAM (mux backdoor read vs top write) ----------------

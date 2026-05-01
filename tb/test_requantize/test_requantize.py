@@ -1,12 +1,11 @@
-"""Cocotb tests for rtl/requantize.sv (TFLite-lite mult-shift-saturate, INT32 -> INT8).
+"""Cocotb tests for rtl/requantize.sv (per-lane TFLite-lite mult-shift-saturate, INT32 -> INT8).
 
-Reference: plan.md §3.1.1 and tb/common/golden_model.py::requantize.
+Reference: plan.md §3.1.1 / §阶段 8 and tb/common/golden_model.py::requantize.
 """
 
 from __future__ import annotations
 
 import os
-import random
 import sys
 
 import numpy as np
@@ -16,7 +15,10 @@ from cocotb.triggers import Timer
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(THIS_DIR, "..", "common"))
-from golden_model import requantize as golden_requantize  # noqa: E402
+from golden_model import (  # noqa: E402
+    requantize as golden_requantize,
+    requantize_per_channel as golden_requantize_pc,
+)
 
 
 LANES = 4
@@ -42,19 +44,37 @@ def pack32(vals):
     return val
 
 
+def pack_mults(vals):
+    val = 0
+    for c, v in enumerate(vals):
+        val |= (int(v) & 0xFFFF_FFFF) << (c * P_W)
+    return val
+
+
+def pack_shifts(vals):
+    val = 0
+    for c, v in enumerate(vals):
+        val |= (int(v) & 0x3F) << (c * 6)
+    return val
+
+
 def unpack8(raw: int):
     return [s8((raw >> (c * O_W)) & 0xFF) for c in range(LANES)]
 
 
-async def apply_and_check(dut, *, acc, mult, shift, req_en, expected):
+async def apply_and_check(dut, *, acc, mults, shifts, req_en, expected):
+    if not isinstance(mults, (list, tuple)):
+        mults = [mults] * LANES
+    if not isinstance(shifts, (list, tuple)):
+        shifts = [shifts] * LANES
     dut.acc_in.value = pack32(acc)
-    dut.mult.value = mult & 0xFFFF_FFFF
-    dut.shift.value = shift
+    dut.mult.value = pack_mults(mults)
+    dut.shift.value = pack_shifts(shifts)
     dut.req_en.value = req_en
     await Timer(SETTLE_NS, units="ns")
     got = unpack8(int(dut.data_out.value))
     assert got == expected, (
-        f"acc={acc} mult={mult} shift={shift} req_en={req_en}\n"
+        f"acc={acc} mult={mults} shift={shifts} req_en={req_en}\n"
         f"got={got} expected={expected}"
     )
 
@@ -62,6 +82,11 @@ async def apply_and_check(dut, *, acc, mult, shift, req_en, expected):
 def model_requantize(acc, mult, shift):
     arr = np.array(acc, dtype=np.int32)
     return [int(x) for x in golden_requantize(arr, mult, shift)]
+
+
+def model_requantize_pc(acc, mults, shifts):
+    arr = np.array(acc, dtype=np.int32)
+    return [int(x) for x in golden_requantize_pc(arr, mults, shifts)]
 
 
 @cocotb.test()
@@ -73,46 +98,34 @@ async def test_req_bypass(dut):
         ([0x12345678, -0x12345678, 0xFF, -1], [0x78, -0x78, -1, -1]),
     ]
     for acc, exp in cases:
-        await apply_and_check(dut, acc=acc, mult=1, shift=0, req_en=0, expected=exp)
+        await apply_and_check(dut, acc=acc, mults=1, shifts=0, req_en=0, expected=exp)
 
 
 @cocotb.test()
 async def test_req_shift_zero(dut):
     """shift=0: no rounding bias, product is taken as-is then saturated."""
     acc = [10, -10, 200, -200]
-    mult = 1
-    expected = model_requantize(acc, mult, 0)
-    await apply_and_check(dut, acc=acc, mult=mult, shift=0, req_en=1, expected=expected)
-    # Larger products that saturate at shift=0:
+    expected = model_requantize(acc, 1, 0)
+    await apply_and_check(dut, acc=acc, mults=1, shifts=0, req_en=1, expected=expected)
     acc2 = [127, -128, 1, -1]
-    mult2 = 1000
-    exp2 = model_requantize(acc2, mult2, 0)
-    await apply_and_check(dut, acc=acc2, mult=mult2, shift=0, req_en=1, expected=exp2)
+    exp2 = model_requantize(acc2, 1000, 0)
+    await apply_and_check(dut, acc=acc2, mults=1000, shifts=0, req_en=1, expected=exp2)
 
 
 @cocotb.test()
 async def test_req_shift_max(dut):
     """shift=31: very large divisor, most outputs are 0 or +/-1 with rounding."""
     acc = [1 << 30, -(1 << 30), (1 << 29), -(1 << 29)]
-    mult = 1
-    expected = model_requantize(acc, mult, 31)
-    await apply_and_check(dut, acc=acc, mult=mult, shift=31, req_en=1, expected=expected)
+    expected = model_requantize(acc, 1, 31)
+    await apply_and_check(dut, acc=acc, mults=1, shifts=31, req_en=1, expected=expected)
 
 
 @cocotb.test()
 async def test_req_round_half_up(dut):
-    """Verify round-half-up: +0.5 -> +1, -0.5 -> 0 (not -1).
-
-    With shift=1, round_bias=1, so (x + 1) >> 1.
-       acc=1: (1 + 1) >> 1 = 1
-       acc=-1: (-1 + 1) >> 1 = 0
-       acc=3: (3 + 1) >> 1 = 2
-       acc=-3: (-3 + 1) >> 1 = -1
-    """
+    """Verify round-half-up: +0.5 -> +1, -0.5 -> 0 (not -1)."""
     acc = [1, -1, 3, -3]
-    mult = 1
-    expected = model_requantize(acc, mult, 1)
-    await apply_and_check(dut, acc=acc, mult=mult, shift=1, req_en=1, expected=expected)
+    expected = model_requantize(acc, 1, 1)
+    await apply_and_check(dut, acc=acc, mults=1, shifts=1, req_en=1, expected=expected)
     assert expected == [1, 0, 2, -1]
 
 
@@ -120,32 +133,50 @@ async def test_req_round_half_up(dut):
 async def test_req_saturate(dut):
     """Output saturates at +127 / -128."""
     acc = [10000, -10000, 1, -1]
-    mult = 1 << 20
-    expected = model_requantize(acc, mult, 0)
+    expected = model_requantize(acc, 1 << 20, 0)
     assert expected[0] == 127 and expected[1] == -128
-    await apply_and_check(dut, acc=acc, mult=mult, shift=0, req_en=1, expected=expected)
+    await apply_and_check(dut, acc=acc, mults=1 << 20, shifts=0, req_en=1, expected=expected)
 
 
 @cocotb.test()
 async def test_req_signed_mult(dut):
     """Negative mult flips sign of result."""
     acc = [10, -10, 100, -100]
-    mult_pos = 1
-    mult_neg = -1
-    exp_pos = model_requantize(acc, mult_pos, 0)
-    exp_neg = model_requantize(acc, mult_neg, 0)
-    await apply_and_check(dut, acc=acc, mult=mult_pos, shift=0, req_en=1, expected=exp_pos)
-    await apply_and_check(dut, acc=acc, mult=mult_neg, shift=0, req_en=1, expected=exp_neg)
+    exp_pos = model_requantize(acc, 1, 0)
+    exp_neg = model_requantize(acc, -1, 0)
+    await apply_and_check(dut, acc=acc, mults=1, shifts=0, req_en=1, expected=exp_pos)
+    await apply_and_check(dut, acc=acc, mults=-1, shifts=0, req_en=1, expected=exp_neg)
 
 
 @cocotb.test()
 async def test_req_random(dut):
-    """Random fuzz across acc / mult / shift, compared to numpy golden."""
+    """Random fuzz across acc / mult / shift broadcast (golden = scalar requantize)."""
     rng = np.random.default_rng(0xDEADBEEF)
-    for _ in range(300):
+    for _ in range(150):
         acc = list(rng.integers(-(1 << 31), 1 << 31, size=LANES, dtype=np.int64))
-        # Keep mult moderate to exercise the full range without flooding INT64.
         mult = int(rng.integers(-(1 << 20), 1 << 20))
         shift = int(rng.integers(0, 32))
         expected = model_requantize(acc, mult, shift)
-        await apply_and_check(dut, acc=acc, mult=mult, shift=shift, req_en=1, expected=expected)
+        await apply_and_check(dut, acc=acc, mults=mult, shifts=shift, req_en=1, expected=expected)
+
+
+@cocotb.test()
+async def test_req_per_channel(dut):
+    """Each lane uses an independent (mult, shift)."""
+    acc = [1000, -1000, 250, -250]
+    mults = [1 << 20, 1 << 18, -(1 << 20), 1 << 22]
+    shifts = [12, 8, 14, 18]
+    expected = model_requantize_pc(acc, mults, shifts)
+    await apply_and_check(dut, acc=acc, mults=mults, shifts=shifts, req_en=1, expected=expected)
+
+
+@cocotb.test()
+async def test_req_per_channel_random(dut):
+    """Random fuzz with per-lane mult/shift, golden via requantize_per_channel."""
+    rng = np.random.default_rng(0xC0FFEE)
+    for _ in range(150):
+        acc = list(rng.integers(-(1 << 31), 1 << 31, size=LANES, dtype=np.int64))
+        mults = [int(rng.integers(-(1 << 20), 1 << 20)) for _ in range(LANES)]
+        shifts = [int(rng.integers(0, 32)) for _ in range(LANES)]
+        expected = model_requantize_pc(acc, mults, shifts)
+        await apply_and_check(dut, acc=acc, mults=mults, shifts=shifts, req_en=1, expected=expected)

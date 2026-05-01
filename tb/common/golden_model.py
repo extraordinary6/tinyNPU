@@ -51,3 +51,28 @@ def requantize(acc: np.ndarray, mult: int, shift: int) -> np.ndarray:
     shifted = (product + round_bias) >> shift
     clipped = np.clip(shifted, INT8_MIN, INT8_MAX)
     return clipped.astype(np.int8)
+
+
+def requantize_per_channel(acc: np.ndarray, mults, shifts) -> np.ndarray:
+    """Per-channel TFLite-lite requantize.
+
+    acc : 1-D length LANES, or 2-D [M, LANES].
+    mults, shifts : sequences of length LANES.
+    """
+    assert acc.dtype == np.int32
+    mults = np.asarray(mults, dtype=np.int64)
+    shifts = np.asarray(shifts, dtype=np.int64)
+    assert mults.ndim == 1 and shifts.ndim == 1
+    assert mults.shape == shifts.shape
+    assert ((-(1 << 31) <= mults) & (mults <= (1 << 31) - 1)).all()
+    assert ((0 <= shifts) & (shifts <= 31)).all()
+
+    out = np.empty_like(acc, dtype=np.int8)
+    if acc.ndim == 1:
+        for c, (m, s) in enumerate(zip(mults, shifts)):
+            out[c] = requantize(acc[c:c+1], int(m), int(s))[0]
+        return out
+    for c, (m, s) in enumerate(zip(mults, shifts)):
+        out[:, c] = requantize(acc[:, c].astype(np.int32), int(m), int(s))
+    return out
+

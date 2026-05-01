@@ -12,8 +12,10 @@ For full architectural detail and per-phase milestones, see [`plan.md`](./plan.m
 
 ## Status
 
-Phase 0 through 7 are complete. The full v1 datapath runs GEMM, optional ReLU,
-and TFLite-lite requantize, all driven through the APB3 CSR interface.
+Phase 0 through 10 are complete. The full datapath runs GEMM with arbitrary
+K (multiple of 4) accumulated across multiple weight tiles, optional bias,
+ReLU, and TFLite-lite requantize (global or per-channel), all driven through
+the APB3 CSR interface.
 
 | Phase | Content | State |
 |-------|---------|-------|
@@ -25,46 +27,69 @@ and TFLite-lite requantize, all driven through the APB3 CSR interface.
 | 5 | `apb_csr` (APB3 slave) + `ctrl_fsm` (top FSM) | done |
 | 6 | `tinyNPU_top` end-to-end integration | done |
 | 7 | Verilator strict lint clean, basic regression script | done |
-| 8+ | Per-channel requantize / bias loader / K-tile / N-tile / 8×8 / Conv2D / coverage | planned (`plan.md` §7+) |
+| 8 | Per-channel requantize (`req_param_loader.sv`, `FLAGS.PCH_REQ_EN`) | done |
+| 9 | Bias loader (`bias_loader.sv`, dedicated bias SRAM, `FLAGS.BIAS_EN` live) | done |
+| 10 | K-tile accumulation (`row_accumulator.sv`, K > 4) | done |
+| 11+ | N-tile / 8×8 / Conv2D / coverage | planned (`plan.md` §11+) |
 
-### v1 capabilities (after phase 7)
+### Capabilities (after phase 10)
 
-- Single 4×4 GEMM tile per kick: `C = A @ W`, A is `M × 4`, W is `4 × 4`,
-  output is `M × 4` INT8 (or low byte of INT32 in bypass mode).
-- `FLAGS.RELU_EN`: ReLU on the accumulator output.
+- GEMM `C = A @ W` with `A: M × K`, `W: K × 4`, `K` any multiple of 4, output
+  `M × 4` INT8 (or low byte of INT32 in bypass mode). Internally the engine
+  loops `K_TILES = K / 4` times over `LOAD_W → COMPUTE`, accumulating
+  partial sums per-(row, lane) in `row_accumulator`. Bias / requantize
+  parameters load only on the first tile.
+- `FLAGS.BIAS_EN`: 4×INT32 bias loaded from a dedicated bias SRAM at
+  `BIAS_BASE` (`ctrl_fsm` runs `LOAD_BIAS` between `LOAD_W` and `COMPUTE` of
+  the first tile).
+- `FLAGS.RELU_EN`: ReLU on the bias-add output.
 - `FLAGS.REQ_EN`: TFLite-lite requantize (signed mult-shift-saturate).
-- M / N / K = 0 → `STATUS.ERR` pulses for one cycle.
+- `FLAGS.PCH_REQ_EN`: per-channel requantize. When set, `ctrl_fsm` runs an
+  extra `LOAD_REQ` state on the first tile, pulling `LANES × INT32` mults
+  from `REQ_MULT_BASE` and `LANES × INT8` shifts (low byte of each lane
+  slot) from `REQ_SHIFT_BASE`, both in W SRAM.
+- M / N / K = 0 or `K_TILES = K / COLS = 0` → `STATUS.ERR` pulses for one cycle.
 - Verilator `--lint-only -Wall` passes with zero warnings.
 
-### Known v1 limitations (addressed by phases 8+)
+### SRAM layout (caller responsibility for K-tile)
 
-- K must equal 4 (no K-tile accumulation across multiple weight tiles).
+- IFM SRAM: `A[M, K]` stored tile-major. Tile `k` slice `A[:, k*4:(k+1)*4]`
+  occupies addresses `IFM_BASE + k*M ... + k*M + M-1`.
+- W SRAM: tile `k` weight slab `W[k*4:(k+1)*4, 0:4]` at `W_BASE + k`.
+- OFM SRAM: `M` output rows at `OFM_BASE + 0 ... + M-1`.
+
+### Known limitations (addressed by phases 11+)
+
 - N must equal 4 (no N-tile sweep).
-- `bias_in` is hard-wired to 0; `FLAGS.BIAS_EN` is currently a no-op.
-- `req_mult` / `req_shift` are global, not per-channel.
+- K must be a positive multiple of 4 (caller-enforced; `K_TILES = K / 4`).
 
-Pipeline latency from `if_start` to first OFM write = 9 cycles
-(FSM startup + SRAM read + 4-deep PE column + 3-deep unskew).
+Pipeline latency from each tile's `if_start` to first OFM write = 9 cycles
+(FSM startup + SRAM read + 4-deep PE column + 3-deep unskew). For `K_TILES > 1`
+the writer fires only on the last tile, so overall kick latency scales with
+`K_TILES * (LOAD_W_cycles + COMPUTE_cycles)`.
 
 ## Test summary
 
-13 cocotb testbenches, 64 cases total. Run them all with `bash scripts/run_all.sh`.
+16 cocotb testbenches, 102 cases total. Run them all with `bash scripts/run_all.sh`.
 
 | Testbench | Cases | DUT |
 |-----------|-------|-----|
-| `tb/test_dff/`             | 2 | toolchain smoke |
-| `tb/test_pe/`              | 6 | `rtl/pe.sv` |
-| `tb/test_systolic_array/`  | 5 | `rtl/systolic_array.sv` |
-| `tb/test_accumulator/`     | 5 | `rtl/accumulator.sv` |
-| `tb/test_bias_relu/`       | 5 | `rtl/bias_relu.sv` |
-| `tb/test_requantize/`      | 7 | `rtl/requantize.sv` |
-| `tb/test_sram_wrapper/`    | 4 | `rtl/sram_wrapper.sv` |
-| `tb/test_weight_loader/`   | 4 | `rtl/weight_loader.sv` (+sram harness) |
-| `tb/test_ofm_writer/`      | 4 | `rtl/ofm_writer.sv` (+sram harness) |
-| `tb/test_ifm_feeder/`      | 5 | `rtl/ifm_feeder.sv` (+sram harness) |
-| `tb/test_apb_csr/`         | 7 | `rtl/apb_csr.sv` |
-| `tb/test_ctrl_fsm/`        | 5 | `rtl/ctrl_fsm.sv` |
-| `tb/test_top/`             | 5 | `rtl/tinyNPU_top.sv` (end-to-end via APB) |
+| `tb/test_dff/`               | 2 | toolchain smoke |
+| `tb/test_pe/`                | 6 | `rtl/pe.sv` |
+| `tb/test_systolic_array/`    | 5 | `rtl/systolic_array.sv` |
+| `tb/test_accumulator/`       | 5 | `rtl/accumulator.sv` |
+| `tb/test_row_accumulator/`   | 5 | `rtl/row_accumulator.sv` |
+| `tb/test_bias_relu/`         | 5 | `rtl/bias_relu.sv` |
+| `tb/test_requantize/`        | 9 | `rtl/requantize.sv` (incl. per-channel) |
+| `tb/test_sram_wrapper/`      | 4 | `rtl/sram_wrapper.sv` |
+| `tb/test_weight_loader/`     | 4 | `rtl/weight_loader.sv` (+sram harness) |
+| `tb/test_ofm_writer/`        | 4 | `rtl/ofm_writer.sv` (+sram harness) |
+| `tb/test_ifm_feeder/`        | 5 | `rtl/ifm_feeder.sv` (+sram harness) |
+| `tb/test_req_param_loader/`  | 4 | `rtl/req_param_loader.sv` (+sram harness) |
+| `tb/test_bias_loader/`       | 5 | `rtl/bias_loader.sv` (+sram harness) |
+| `tb/test_apb_csr/`           | 7 | `rtl/apb_csr.sv` |
+| `tb/test_ctrl_fsm/`          | 9 | `rtl/ctrl_fsm.sv` (incl. K-tile loop) |
+| `tb/test_top/`               | 11 | `rtl/tinyNPU_top.sv` (incl. K=8, K=12) |
 
 ## Toolchain & setup
 
@@ -161,12 +186,15 @@ tinyNPU/
 ├── plan.md                  Detailed roadmap, architecture, register map, coding rules
 ├── README.md                This file
 ├── requirements.txt         cocotb==1.8.1, numpy<1.22, pytest<7.5
-├── rtl/                     SystemVerilog sources (12 modules)
+├── rtl/                     SystemVerilog sources (15 modules)
 │   ├── pe.sv
 │   ├── systolic_array.sv
 │   ├── accumulator.sv
+│   ├── row_accumulator.sv
 │   ├── bias_relu.sv
 │   ├── requantize.sv
+│   ├── req_param_loader.sv
+│   ├── bias_loader.sv
 │   ├── sram_wrapper.sv
 │   ├── ifm_feeder.sv
 │   ├── weight_loader.sv
@@ -195,13 +223,10 @@ The strict rules live in `plan.md` §8. Highlights:
 
 ## Roadmap beyond v1
 
-Phases 8 through 14 are described in detail in `plan.md`. In short:
+Phases 11 through 14 are described in detail in `plan.md`. In short:
 
 | Phase | Headline goal | Effort |
 |-------|---------------|--------|
-| 8  | Per-channel requantize | 1–2 d |
-| 9  | Bias loader (FLAGS.BIAS_EN actually works) | 1 d |
-| 10 | K-tile accumulation (K > 4) | 2 d |
 | 11 | N-tile sweep (N > 4) + parameterized unskew | 1–2 d |
 | 12 | 8×8 PE array | 1–2 d |
 | 13 | Conv2D via Python im2col driver | 1 d |

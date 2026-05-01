@@ -111,9 +111,11 @@ out_i8      = saturate(shifted_i64, [-128, +127])
 | 0x1C | `W_BASE` | 32 | RW | 权重 SRAM 基址 |
 | 0x20 | `OFM_BASE` | 32 | RW | OFM SRAM 基址 |
 | 0x24 | `BIAS_BASE` | 32 | RW | bias 基址 |
-| 0x28 | `FLAGS` | 32 | RW | `[0]=BIAS_EN [1]=RELU_EN [2]=REQ_EN` |
-| 0x2C | `REQ_MULT` | 32 | RW | requantize 乘数（有符号） |
-| 0x30 | `REQ_SHIFT` | 32 | RW | requantize 右移位数（低 6 位有效） |
+| 0x28 | `FLAGS` | 32 | RW | `[0]=BIAS_EN [1]=RELU_EN [2]=REQ_EN [3]=PCH_REQ_EN` |
+| 0x2C | `REQ_MULT` | 32 | RW | requantize 乘数（有符号，全局模式） |
+| 0x30 | `REQ_SHIFT` | 32 | RW | requantize 右移位数（低 6 位有效，全局模式） |
+| 0x34 | `REQ_MULT_BASE` | 32 | RW | per-channel mult 基址（W SRAM） |
+| 0x38 | `REQ_SHIFT_BASE` | 32 | RW | per-channel shift 基址（W SRAM） |
 
 - `ctrl_fsm.sv` — 顶层 FSM：`IDLE → LOAD_W → COMPUTE → DRAIN → WRITEBACK → DONE`。
 - `tinyNPU_top.sv` — 顶层集成。
@@ -148,6 +150,9 @@ tinyNPU/
 │   ├── accumulator.sv
 │   ├── bias_relu.sv
 │   ├── requantize.sv
+│   ├── req_param_loader.sv
+│   ├── bias_loader.sv
+│   ├── row_accumulator.sv
 │   ├── sram_wrapper.sv
 │   ├── ifm_feeder.sv
 │   ├── weight_loader.sv
@@ -257,39 +262,42 @@ tinyNPU/
 
 ---
 
-### 阶段 8 — Per-channel requantize
+### 阶段 8 — Per-channel requantize （已完成）
 **目标**：每 lane 独立的 mult/shift，是常见 INT8 推理框架的真实需求。
 
-- 改 `requantize.sv`：`mult` 与 `shift` 端口从标量改成 LANES 个数组。
-- 新 CSR：`REQ_MULT_BASE` (0x34)、`REQ_SHIFT_BASE` (0x38)；指向 W SRAM 内存放 N×INT32 mult 与 N×INT8 shift 的位置。
-- 新模块 `req_param_loader.sv`：在 LOAD_W 后读两个地址，把 N×mult / N×shift 锁进内部 latch。
-- 测试：扩展 `test_requantize` 覆盖 per-channel 模式；`test_top` 加一个 per-channel GEMM 用例。
-
-预计：1–2 天。
+实际实现：
+- `requantize.sv` 端口改为 `[LANES*P_W-1:0] mult` + `[LANES*6-1:0] shift`，generate 内每 lane 独立 mult-shift-saturate。
+- 新模块 `req_param_loader.sv`：FSM `IDLE → FETCH_MULT → LATCH_MULT → FETCH_SHIFT → LATCH_SHIFT → DONE`，从 W SRAM 同一端口分两次读 `LANES×INT32` 的 mult 词与 `LANES×INT32` shift 词（低 6 位有效）。
+- `apb_csr` 新增 `REQ_MULT_BASE` (0x34) 与 `REQ_SHIFT_BASE` (0x38)；`FLAGS[3]=PCH_REQ_EN` 选择 per-channel 路径。
+- `ctrl_fsm` 新增 `S_LOAD_REQ` 状态（仅当 `pch_req_en=1` 时进入），确保 `req_param_loader` 与 `weight_loader` 串行复用 W SRAM 端口。
+- `tinyNPU_top` 内 `req_mult_active / req_shift_active` 由 `FLAGS[3]` 在"全局广播"和"loader 锁存"之间切换。
+- 测试：`test_requantize` 增加 per-channel 定向 + 随机用例（共 9 cases）；新增 `tb/test_req_param_loader/`（4 cases）；`test_top` 加 `test_top_per_channel_requantize` 端到端用例；`test_ctrl_fsm` 增加 `test_fsm_per_channel_path`。
+- Verilator `--lint-only -Wall` 仍 0 警告。
 
 ---
 
-### 阶段 9 — Bias loader
+### 阶段 9 — Bias loader （已完成）
 **目标**：让 `FLAGS.BIAS_EN` 真正生效。
 
-- 新模块 `bias_loader.sv`（结构上类似 `weight_loader.sv`）：从 `BIAS_BASE` 读一个 4×INT32 word，锁进内部 latch。
-- `ctrl_fsm` 增加 LOAD_BIAS 状态，在 LOAD_W 后并行或串行运行。
-- top 把 `bias_relu.bias_in` 接 latch 输出（替换当前的硬零）。
-- 测试：`test_bias_loader` 单元；`test_top` 加 `bias+ReLU+requantize` 端到端。
-
-预计：1 天。
+实际实现：
+- 新模块 `rtl/bias_loader.sv`：FSM `IDLE → FETCH → LATCH → DONE`，从专用 bias SRAM 单端口读一个 `LANES×INT32` word 锁存为 `bias_out`。
+- `tinyNPU_top` 新增 `bias_sram_en / bias_sram_addr / bias_sram_rdata` 三个端口（独立的 bias SRAM，不复用 W SRAM 端口），`bias_relu.bias_in` 接 `bias_loader.bias_out`。
+- `ctrl_fsm` 增加 `S_LOAD_BIAS` 状态（仅当 `bias_en=1` 进入），路径：`LOAD_W → [LOAD_BIAS] → [LOAD_REQ] → COMPUTE`。
+- 测试：新增 `tb/test_bias_loader/`（5 cases，覆盖 idle/单次/连续/全零/锁存保持）；`test_top` 新增 `test_top_bias_relu_requantize` 与 `test_top_bias_only` 端到端用例；`test_ctrl_fsm` 新增 `test_fsm_bias_path` 与 `test_fsm_bias_plus_pch_path`。
+- Verilator `--lint-only -Wall` 仍 0 警告。
 
 ---
 
-### 阶段 10 — K 分块累加
+### 阶段 10 — K 分块累加 （已完成）
 **目标**：解除 K 必须等于阵列列数（4）的限制。
 
-- 当前架空的 `accumulator.sv` 重新接进数据通路，位于 unskew 之后、bias_relu 之前。
-- `ctrl_fsm` 改造：`K_TILES = ceil(K / 4)`，每个 tile 重新 LOAD_W + COMPUTE，clr 仅在第一个 tile 拉，其它 tile en=row_valid 累加。
-- `valid_gen` 在最后一个 tile 才把数据交给 ofm_writer。
-- 测试：`test_top` 加 K=8 / K=12 GEMM。
-
-预计：2 天（FSM 改造点最多）。
+实际实现：
+- 新模块 `rtl/row_accumulator.sv`：按 (row, lane) 索引的 INT32 累加器堆，深度参数化 `M_MAX`；`first_tile=1` 时直接写入 psum_in（不读旧值），`data_valid=1` 时 read-modify-write。
+- `ctrl_fsm` 加 `k_tiles_total` 输入与 `tile_idx / first_tile / last_tile` 输出；状态流改为 `LOAD_W → [LOAD_BIAS / LOAD_REQ 仅 first_tile] → COMPUTE → (last_tile? WRITEBACK : LOAD_W loop)`。
+- `tinyNPU_top` 把 row_accumulator 接到 unskew 与 bias_relu 之间；`weight_loader.base_addr = w_base + tile_idx`；`ifm_feeder.base_addr = ifm_base + tile_idx*M`（用寄存器累加 M，避免乘法）；`ofm_writer.start / data_valid` 都用"valid_gen 视角"的 `data_last_tile` 门控（避免 ctrl_fsm 在 valid_gen 完成 tile 0 数据窗口前就已切到 tile 1 导致 first_tile 提前消失的 bug）。
+- SRAM 布局约定：IFM tile-major（tile k 的 M 行放在 `ifm_base + k*M ... + (k+1)*M - 1`），W 每 tile 一个地址（`w_base + k`），OFM 不变。
+- 测试：新增 `tb/test_row_accumulator/`（5 cases）；`test_ctrl_fsm` 增至 9 cases（K-tile 循环 + bias 仅 first_tile）；`test_top` 增至 11 cases，含 `test_top_ktile_k8` / `test_top_ktile_k12_relu_req` / `test_top_ktile_k8_bias_relu_req`。
+- Verilator `--lint-only -Wall` 仍 0 警告。
 
 ---
 

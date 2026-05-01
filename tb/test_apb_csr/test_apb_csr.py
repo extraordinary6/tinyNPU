@@ -32,6 +32,8 @@ A_BIAS = 0x024
 A_FLAGS = 0x028
 A_REQ_MULT = 0x02C
 A_REQ_SHIFT = 0x030
+A_REQ_MULT_BASE = 0x034
+A_REQ_SHIFT_BASE = 0x038
 
 RW_REGS = [
     ("M", A_M, "m_count"),
@@ -44,6 +46,8 @@ RW_REGS = [
     ("FLAGS", A_FLAGS, "flags"),
     ("REQ_MULT", A_REQ_MULT, "req_mult"),
     ("REQ_SHIFT", A_REQ_SHIFT, "req_shift"),
+    ("REQ_MULT_BASE", A_REQ_MULT_BASE, "req_mult_base"),
+    ("REQ_SHIFT_BASE", A_REQ_SHIFT_BASE, "req_shift_base"),
 ]
 
 
@@ -128,7 +132,8 @@ async def test_csr_rw_roundtrip(dut):
     payload = {
         A_M: 0x0000_0010, A_N: 0x0000_0020, A_K: 0x0000_0040,
         A_IFM: 0x1000, A_W: 0x2000, A_OFM: 0x3000, A_BIAS: 0x4000,
-        A_FLAGS: 0x0000_0007, A_REQ_MULT: 0xFFFF_F000, A_REQ_SHIFT: 0x0000_001F,
+        A_FLAGS: 0x0000_000F, A_REQ_MULT: 0xFFFF_F000, A_REQ_SHIFT: 0x0000_001F,
+        A_REQ_MULT_BASE: 0x5000, A_REQ_SHIFT_BASE: 0x6000,
     }
     for addr, data in payload.items():
         rdy, err = await apb_write(dut, addr, data)

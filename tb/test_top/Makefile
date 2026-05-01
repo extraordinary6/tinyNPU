@@ -4,6 +4,9 @@ VERILOG_SOURCES := $(abspath ../../rtl/pe.sv) \
                    $(abspath ../../rtl/systolic_array.sv) \
                    $(abspath ../../rtl/bias_relu.sv) \
                    $(abspath ../../rtl/requantize.sv) \
+                   $(abspath ../../rtl/req_param_loader.sv) \
+                   $(abspath ../../rtl/bias_loader.sv) \
+                   $(abspath ../../rtl/row_accumulator.sv) \
                    $(abspath ../../rtl/sram_wrapper.sv) \
                    $(abspath ../../rtl/ifm_feeder.sv) \
                    $(abspath ../../rtl/weight_loader.sv) \
