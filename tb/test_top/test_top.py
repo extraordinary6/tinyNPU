@@ -868,3 +868,78 @@ async def test_top_ntile_n8_ktile_k8_full(dut):
     expected = model_req(acc, int(req_mult), int(req_shift)).astype(np.int8)
     got = await read_ofm_full(dut, 0x60, M, N)
     np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_4x4_cycle_count(dut):
+    """Measure start-to-busy=0 cycle count for a single-tile 4x4 GEMM (M=4).
+
+    Used as the 4x4 data point for docs/perf.md. Pairs with the 8x8
+    measurement in tb/test_top_8x8/test_top_8x8.py.
+    """
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    M = 4
+    N = COLS
+    K = ROWS
+    A = np.ones((M, K), dtype=np.int8)
+    W = np.ones((K, N), dtype=np.int8)
+
+    await load_ifm(dut, A, base=0)
+    await load_w(dut, W, addr=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x40,
+                    flags=0, req_mult=1, req_shift=0)
+
+    await apb_write(dut, A_CTRL, 0x1)
+    cycles = 0
+    seen_busy = False
+    for _ in range(200):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        cycles += 1
+        if int(dut.u_dut.busy.value):
+            seen_busy = True
+        elif seen_busy:
+            break
+    assert seen_busy
+    cocotb.log.info(f"4x4 GEMM (M={M}, N={N}, K={K}) cycles to busy=0: {cycles}")
+
+
+@cocotb.test()
+async def test_top_4x4_cycle_count_n8k8(dut):
+    """Measure cycle count for the M=4, N=8, K=8 problem on the 4x4 array.
+
+    Same problem as test_top_8x8_cycle_count but lowered onto a 4x4
+    array, so the engine has to walk 2 N tiles x 2 K tiles = 4 tiles.
+    Used for the perf comparison in docs/perf.md.
+    """
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    M = 4
+    N = 8
+    K = 8
+    A = np.ones((M, K), dtype=np.int8)
+    W = np.ones((K, N), dtype=np.int8)
+
+    await load_ifm_ktile(dut, A, ifm_base=0, M=M)
+    await load_w_full(dut, W, w_base=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x40,
+                    flags=0, req_mult=1, req_shift=0)
+
+    await apb_write(dut, A_CTRL, 0x1)
+    cycles = 0
+    seen_busy = False
+    for _ in range(400):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        cycles += 1
+        if int(dut.u_dut.busy.value):
+            seen_busy = True
+        elif seen_busy:
+            break
+    assert seen_busy
+    cocotb.log.info(f"4x4 GEMM (M={M}, N={N}, K={K}) cycles to busy=0: {cycles}")

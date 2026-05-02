@@ -114,6 +114,7 @@ module tinyNPU_top #(
     logic                    rp_start, rp_done;
     logic                    if_start, if_done;
     logic                    ow_start_int, ow_done;
+    logic                    compute_done;
     logic [K_TILE_W-1:0]     tile_idx;
     logic                    first_tile, last_tile;
     logic [N_TILE_W-1:0]     n_tile_idx;
@@ -149,7 +150,7 @@ module tinyNPU_top #(
         .rp_start      (rp_start),
         .rp_done       (rp_done),
         .if_start      (if_start),
-        .if_done       (if_done),
+        .compute_done  (compute_done),
         .ow_start      (ow_start_int),
         .ow_done       (ow_done),
         .tile_idx      (tile_idx),
@@ -342,6 +343,14 @@ module tinyNPU_top #(
     assign psum_unskewed[(COLS-1)*P_W +: P_W] = sys_psum[(COLS-1)*P_W +: P_W];
 
     // ---------------- valid_gen FSM (per-tile data_valid window) ----------------
+    // Pipeline latency from if_start to first data_valid:
+    //   1 (FSM startup) + 1 (SRAM read) + ROWS (PE column depth)
+    //   + (COLS-1) (deepest unskew lane) = ROWS + COLS + 1.
+    // The counter spans cycles in VG_LAT (one cycle per increment) and
+    // transitions to VG_VAL when it reaches LATENCY - 2 = ROWS + COLS - 1.
+    localparam int VG_LAT_TARGET = ROWS + COLS - 1;
+    localparam int VG_LAT_W      = (VG_LAT_TARGET == 0) ? 1 : $clog2(VG_LAT_TARGET + 1);
+
     typedef enum logic [1:0] {
         VG_IDLE = 2'd0,
         VG_LAT  = 2'd1,
@@ -349,8 +358,8 @@ module tinyNPU_top #(
     } vg_state_t;
 
     vg_state_t vg_state, vg_state_n;
-    logic [3:0]      vg_lat_cnt;
-    logic [M_W-1:0]  vg_val_cnt;
+    logic [VG_LAT_W-1:0] vg_lat_cnt;
+    logic [M_W-1:0]      vg_val_cnt;
 
     always_ff @(posedge pclk) begin
         if (!presetn) vg_state <= VG_IDLE;
@@ -361,7 +370,7 @@ module tinyNPU_top #(
         vg_state_n = vg_state;
         unique case (vg_state)
             VG_IDLE: if (if_start) vg_state_n = VG_LAT;
-            VG_LAT:  if (vg_lat_cnt == 4'd7) vg_state_n = VG_VAL;
+            VG_LAT:  if (vg_lat_cnt == VG_LAT_W'(VG_LAT_TARGET)) vg_state_n = VG_VAL;
             VG_VAL:  if (vg_val_cnt == m_count_w[M_W-1:0] - {{(M_W-1){1'b0}}, 1'b1})
                         vg_state_n = VG_IDLE;
             default: vg_state_n = VG_IDLE;
@@ -369,9 +378,9 @@ module tinyNPU_top #(
     end
 
     always_ff @(posedge pclk) begin
-        if (!presetn)                vg_lat_cnt <= 4'd0;
-        else if (vg_state != VG_LAT) vg_lat_cnt <= 4'd0;
-        else                         vg_lat_cnt <= vg_lat_cnt + 4'd1;
+        if (!presetn)                vg_lat_cnt <= {VG_LAT_W{1'b0}};
+        else if (vg_state != VG_LAT) vg_lat_cnt <= {VG_LAT_W{1'b0}};
+        else                         vg_lat_cnt <= vg_lat_cnt + {{(VG_LAT_W-1){1'b0}}, 1'b1};
     end
 
     always_ff @(posedge pclk) begin
@@ -395,6 +404,12 @@ module tinyNPU_top #(
     // same edge.
     logic data_done_pulse;
     assign data_done_pulse = (vg_state == VG_VAL) && (vg_state_n == VG_IDLE);
+
+    // ctrl_fsm waits for the data-side drain rather than ifm_feeder's own
+    // done pulse: the latter fires after the input stream finishes but
+    // before the systolic array drains, so using it would let LOAD_W
+    // overwrite PE weights mid-flight (especially as ROWS+COLS grow).
+    assign compute_done = data_done_pulse;
 
     logic [K_TILE_W-1:0] data_tile_idx;
     logic [N_TILE_W-1:0] data_n_tile_idx;
@@ -555,6 +570,7 @@ module tinyNPU_top #(
                           bl_busy_unused,
                           rp_busy_unused,
                           if_busy_unused,
+                          if_done,
                           ow_busy_unused,
                           ow_start_int,
                           tile_idx,

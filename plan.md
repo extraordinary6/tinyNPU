@@ -315,14 +315,18 @@ tinyNPU/
 
 ---
 
-### 阶段 12 — 8×8 阵列扩展
+### 阶段 12 — 8×8 阵列扩展 （已完成）
 **目标**：把 PE 阵列从 4×4 扩到 8×8 看吞吐变化。
 
-- `tinyNPU_top` 顶层参数 ROWS/COLS 已通用化，主要工作在工具链：通用 unskew、ifm_feeder 时序适配（stagger pipeline 深度变 7）。
-- 重新跑全 testbench，验证参数化没断。
-- 在 `docs/perf.md` 记录 4×4 vs 8×8 GEMM 周期数对比、PE 利用率。
-
-预计：1–2 天。
+实际实现：
+- `tinyNPU_top` 把 valid_gen 的 LAT 计数器参数化：`VG_LAT_TARGET = ROWS + COLS - 1`、`VG_LAT_W = $clog2(VG_LAT_TARGET + 1)`，原硬编码 `4'd7` 现在按阵列尺寸自适应。4×4 仍是 9 周期延迟（`8` cycles in LAT + 1 entry），8×8 变成 17 周期。
+- `ctrl_fsm` 的 `S_COMPUTE` 退出条件从 `if_done`（ifm_feeder 输入流结束，提早 `ROWS+COLS-M` 个周期）改成新输入 `compute_done`，由 top 中的 `data_done_pulse` 驱动（valid_gen 数据窗口最后一个周期）。原因：阵列变深后 ifm_feeder 完成与最后一拍 psum 流出之间的窗口拉大到 12 周期（8×8 M=4），如果继续用 `if_done` 触发 LOAD_W，下一个 K tile 的 `w_load` 会在前一 tile 数据还在 PE 流水线里时把 PE 权重改写，导致输出腐化（4×4 时这个窗口正好是 0，所以原版意外地能跑）。
+- `tinyNPU_top` 同步把 ifm_feeder.done 划入 `_unused_ok` 集合（仍连接，只是 ctrl_fsm 不再使用）。
+- 新增 `tb/test_top_8x8/`：参数化的 `top_harness_8x8.sv`（ROWS=COLS=8）+ `test_top_8x8.py`（8 cases，覆盖单 tile/K-tile/N-tile/全特性/per-channel/cycle count）。
+- 新增 `docs/perf.md`：4×4 vs 8×8 周期数对比。同一 M=4/N=8/K=8 GEMM：4×4 阵列要 4 个 tile 共 72 周期，8×8 阵列单 tile 28 周期，2.57× 加速；单 tile 单位下 4×4 用 20 周期算 64 MAC（20% PE 利用率），8×8 用 28 周期算 256 MAC（14.3% PE 利用率）。
+- `test_top` 增加两个 cycle count 测试（`test_top_4x4_cycle_count` / `test_top_4x4_cycle_count_n8k8`）作为 perf.md 的数据点。
+- `test_ctrl_fsm` 把 `if_done` 信号名同步改为 `compute_done`（语义同步：现在 ctrl_fsm 等的是数据侧 drain）。
+- Verilator `--lint-only -Wall` 仍 0 警告。
 
 ---
 

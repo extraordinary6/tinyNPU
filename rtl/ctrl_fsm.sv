@@ -13,6 +13,13 @@
 // WRITEBACK -> [n_last_tile? DONE     : LOAD_W]   <-- N tile loop
 // DONE -> IDLE  (or ERR -> IDLE)
 //
+// COMPUTE waits for compute_done — a data-side drain pulse that fires
+// after the systolic array's last in-flight beat has emerged through the
+// unskew. ifm_feeder's own done pulse arrives earlier (only the input
+// stream finished), and using it would let weight_loader update the PE
+// weights while the previous tile's data is still propagating. The lag
+// from ifm_feeder.done to compute_done is ROWS + COLS - M cycles.
+//
 // tile_idx (K tile index within current N tile) increments at COMPUTE -> LOAD_W
 // transitions and resets at WRITEBACK -> LOAD_W (i.e., at every N tile
 // boundary). first_tile=1 marks the first K tile of the current N tile, so
@@ -43,7 +50,7 @@ module ctrl_fsm #(
     output logic                    rp_start,
     input  logic                    rp_done,
     output logic                    if_start,
-    input  logic                    if_done,
+    input  logic                    compute_done,
     output logic                    ow_start,
     input  logic                    ow_done,
 
@@ -98,16 +105,16 @@ module ctrl_fsm #(
     end
 
     always_ff @(posedge clk) begin
-        if (!rst_n)                                                       tile_idx_q <= {K_TILE_W{1'b0}};
-        else if (state == S_IDLE)                                          tile_idx_q <= {K_TILE_W{1'b0}};
-        else if ((state == S_COMPUTE) && if_done && !last_tile)            tile_idx_q <= tile_idx_q + {{(K_TILE_W-1){1'b0}}, 1'b1};
-        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)        tile_idx_q <= {K_TILE_W{1'b0}};
+        if (!rst_n)                                                          tile_idx_q <= {K_TILE_W{1'b0}};
+        else if (state == S_IDLE)                                             tile_idx_q <= {K_TILE_W{1'b0}};
+        else if ((state == S_COMPUTE) && compute_done && !last_tile)          tile_idx_q <= tile_idx_q + {{(K_TILE_W-1){1'b0}}, 1'b1};
+        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)           tile_idx_q <= {K_TILE_W{1'b0}};
     end
 
     always_ff @(posedge clk) begin
-        if (!rst_n)                                                       n_tile_idx_q <= {N_TILE_W{1'b0}};
-        else if (state == S_IDLE)                                          n_tile_idx_q <= {N_TILE_W{1'b0}};
-        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)        n_tile_idx_q <= n_tile_idx_q + {{(N_TILE_W-1){1'b0}}, 1'b1};
+        if (!rst_n)                                                          n_tile_idx_q <= {N_TILE_W{1'b0}};
+        else if (state == S_IDLE)                                             n_tile_idx_q <= {N_TILE_W{1'b0}};
+        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)           n_tile_idx_q <= n_tile_idx_q + {{(N_TILE_W-1){1'b0}}, 1'b1};
     end
 
     always_comb begin
@@ -134,7 +141,7 @@ module ctrl_fsm #(
             end
             S_LOAD_REQ:  if (rp_done) state_n = S_COMPUTE;
             S_COMPUTE: begin
-                if (if_done) begin
+                if (compute_done) begin
                     if (last_tile) state_n = S_WRITEBACK;
                     else           state_n = S_LOAD_W;
                 end

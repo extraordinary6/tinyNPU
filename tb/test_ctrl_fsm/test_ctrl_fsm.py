@@ -34,7 +34,7 @@ async def reset(dut, cycles=2):
     dut.wl_done.value = 0
     dut.bl_done.value = 0
     dut.rp_done.value = 0
-    dut.if_done.value = 0
+    dut.compute_done.value = 0
     dut.ow_done.value = 0
     for _ in range(cycles):
         await RisingEdge(dut.clk)
@@ -106,7 +106,7 @@ async def test_fsm_happy_path(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
     assert int(dut.ow_start.value) == 1
 
     await RisingEdge(dut.clk)
@@ -140,7 +140,7 @@ async def test_fsm_bias_path(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
     await pulse_done(dut, dut.ow_done)
@@ -172,7 +172,7 @@ async def test_fsm_bias_plus_pch_path(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
     await pulse_done(dut, dut.ow_done)
@@ -199,7 +199,7 @@ async def test_fsm_per_channel_path(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
     await pulse_done(dut, dut.ow_done)
@@ -230,7 +230,7 @@ async def test_fsm_ktile_loop(dut):
 
         await RisingEdge(dut.clk)
         await Timer(SETTLE_NS, units="ns")
-        await pulse_done(dut, dut.if_done)
+        await pulse_done(dut, dut.compute_done)
         if tile < K_TILES - 1:
             # Loops back to LOAD_W of next K tile.
             assert int(dut.wl_start.value) == 1, f"tile={tile}: re-LOAD_W"
@@ -270,7 +270,7 @@ async def test_fsm_ktile_with_bias_first_only(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
 
     # Tile 1: LOAD_W -> COMPUTE directly (no LOAD_BIAS).
     assert int(dut.wl_start.value) == 1
@@ -285,7 +285,7 @@ async def test_fsm_ktile_with_bias_first_only(dut):
 
     await RisingEdge(dut.clk)
     await Timer(SETTLE_NS, units="ns")
-    await pulse_done(dut, dut.if_done)
+    await pulse_done(dut, dut.compute_done)
     assert int(dut.ow_start.value) == 1
 
     await RisingEdge(dut.clk)
@@ -321,7 +321,7 @@ async def test_fsm_ntile_loop(dut):
 
         await RisingEdge(dut.clk)
         await Timer(SETTLE_NS, units="ns")
-        await pulse_done(dut, dut.if_done)
+        await pulse_done(dut, dut.compute_done)
         # last K tile of this N tile -> ow_start.
         assert int(dut.ow_start.value) == 1, f"n_tile={n_tile}: ow_start"
 
@@ -365,7 +365,7 @@ async def test_fsm_ntile_with_bias_per_n(dut):
 
         await RisingEdge(dut.clk)
         await Timer(SETTLE_NS, units="ns")
-        await pulse_done(dut, dut.if_done)
+        await pulse_done(dut, dut.compute_done)
         await RisingEdge(dut.clk)
         await Timer(SETTLE_NS, units="ns")
         await pulse_done(dut, dut.ow_done)
@@ -403,7 +403,7 @@ async def test_fsm_ntile_with_ktile(dut):
 
             await RisingEdge(dut.clk)
             await Timer(SETTLE_NS, units="ns")
-            await pulse_done(dut, dut.if_done)
+            await pulse_done(dut, dut.compute_done)
             compute_runs += 1
 
             if k_tile == K_TILES - 1:
@@ -461,14 +461,14 @@ async def test_fsm_back_to_back_runs(dut):
         await RisingEdge(dut.clk)
         await pulse_done(dut, dut.wl_done)
         await RisingEdge(dut.clk)
-        await pulse_done(dut, dut.if_done)
+        await pulse_done(dut, dut.compute_done)
         await RisingEdge(dut.clk)
         await pulse_done(dut, dut.ow_done)
         # Second N tile.
         await RisingEdge(dut.clk)
         await pulse_done(dut, dut.wl_done)
         await RisingEdge(dut.clk)
-        await pulse_done(dut, dut.if_done)
+        await pulse_done(dut, dut.compute_done)
         await RisingEdge(dut.clk)
         await pulse_done(dut, dut.ow_done)
         assert int(dut.done.value) == 1
