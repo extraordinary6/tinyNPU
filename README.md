@@ -12,9 +12,10 @@ For full architectural detail and per-phase milestones, see [`plan.md`](./plan.m
 
 ## Status
 
-Phase 0 through 10 are complete. The full datapath runs GEMM with arbitrary
-K (multiple of 4) accumulated across multiple weight tiles, optional bias,
-ReLU, and TFLite-lite requantize (global or per-channel), all driven through
+Phase 0 through 11 are complete. The full datapath runs GEMM with arbitrary
+M, arbitrary K (multiple of 4) accumulated across multiple weight tiles, and
+arbitrary N (multiple of 4) swept across multiple column blocks; optional bias,
+ReLU, and TFLite-lite requantize (global or per-channel) all driven through
 the APB3 CSR interface.
 
 | Phase | Content | State |
@@ -30,47 +31,61 @@ the APB3 CSR interface.
 | 8 | Per-channel requantize (`req_param_loader.sv`, `FLAGS.PCH_REQ_EN`) | done |
 | 9 | Bias loader (`bias_loader.sv`, dedicated bias SRAM, `FLAGS.BIAS_EN` live) | done |
 | 10 | K-tile accumulation (`row_accumulator.sv`, K > 4) | done |
-| 11+ | N-tile / 8×8 / Conv2D / coverage | planned (`plan.md` §11+) |
+| 11 | N-tile sweep (N > 4) + parameterized unskew | done |
+| 12+ | 8×8 array / Conv2D / coverage | planned (`plan.md` §12+) |
 
-### Capabilities (after phase 10)
+### Capabilities (after phase 11)
 
-- GEMM `C = A @ W` with `A: M × K`, `W: K × 4`, `K` any multiple of 4, output
-  `M × 4` INT8 (or low byte of INT32 in bypass mode). Internally the engine
-  loops `K_TILES = K / 4` times over `LOAD_W → COMPUTE`, accumulating
-  partial sums per-(row, lane) in `row_accumulator`. Bias / requantize
-  parameters load only on the first tile.
-- `FLAGS.BIAS_EN`: 4×INT32 bias loaded from a dedicated bias SRAM at
-  `BIAS_BASE` (`ctrl_fsm` runs `LOAD_BIAS` between `LOAD_W` and `COMPUTE` of
-  the first tile).
+- GEMM `C = A @ W` with `A: M × K`, `W: K × N`, both `K` and `N` any
+  positive multiple of 4, output `M × N` INT8 (or low byte of INT32 in
+  bypass mode). The engine runs an outer N-tile loop (`N_TILES = N / 4`)
+  wrapping an inner K-tile loop (`K_TILES = K / 4`); for each N tile it
+  loops `LOAD_W → COMPUTE` `K_TILES` times accumulating per-(row, lane)
+  partial sums in `row_accumulator`, then runs `WRITEBACK` once. Bias /
+  requantize parameters reload on the first K tile of every N tile.
+- `FLAGS.BIAS_EN`: per-N-tile bias loaded as `LANES × INT32` words from a
+  dedicated bias SRAM at `BIAS_BASE + n_tile_idx`.
 - `FLAGS.RELU_EN`: ReLU on the bias-add output.
 - `FLAGS.REQ_EN`: TFLite-lite requantize (signed mult-shift-saturate).
 - `FLAGS.PCH_REQ_EN`: per-channel requantize. When set, `ctrl_fsm` runs an
-  extra `LOAD_REQ` state on the first tile, pulling `LANES × INT32` mults
-  from `REQ_MULT_BASE` and `LANES × INT8` shifts (low byte of each lane
-  slot) from `REQ_SHIFT_BASE`, both in W SRAM.
-- M / N / K = 0 or `K_TILES = K / COLS = 0` → `STATUS.ERR` pulses for one cycle.
+  extra `LOAD_REQ` state on the first K tile of every N tile, pulling
+  `LANES × INT32` mults from `REQ_MULT_BASE + n_tile_idx` and
+  `LANES × INT8` shifts (low byte of each lane slot) from
+  `REQ_SHIFT_BASE + n_tile_idx`, both in W SRAM.
+- M / N / K = 0 or `K_TILES = K / COLS = 0` or
+  `N_TILES = N / COLS = 0` → `STATUS.ERR` pulses for one cycle.
 - Verilator `--lint-only -Wall` passes with zero warnings.
 
-### SRAM layout (caller responsibility for K-tile)
+### SRAM layout (caller responsibility)
 
-- IFM SRAM: `A[M, K]` stored tile-major. Tile `k` slice `A[:, k*4:(k+1)*4]`
-  occupies addresses `IFM_BASE + k*M ... + k*M + M-1`.
-- W SRAM: tile `k` weight slab `W[k*4:(k+1)*4, 0:4]` at `W_BASE + k`.
-- OFM SRAM: `M` output rows at `OFM_BASE + 0 ... + M-1`.
+- IFM SRAM: `A[M, K]` stored tile-major over K. Tile k slice
+  `A[:, k*4:(k+1)*4]` occupies addresses `IFM_BASE + k*M ... + k*M + M-1`.
+  Reused unchanged across every N tile.
+- W SRAM: weight tile `(n_tile, k_tile)` — slab
+  `W[k*4:(k+1)*4, n*4:(n+1)*4]` — at address
+  `W_BASE + n*K_TILES + k` (outer-N inner-K order, matching the engine's
+  `wl_done`-driven address counter).
+- BIAS SRAM: one `LANES × INT32` word per N tile, at
+  `BIAS_BASE + n_tile_idx`.
+- REQ params (in W SRAM): one mult word + one shift word per N tile, at
+  `REQ_MULT_BASE + n_tile_idx` and `REQ_SHIFT_BASE + n_tile_idx`.
+- OFM SRAM: tile-major over N. N-tile `n`'s `M` output rows at addresses
+  `OFM_BASE + n*M ... + n*M + M-1`.
 
-### Known limitations (addressed by phases 11+)
+### Known limitations (addressed by phases 12+)
 
-- N must equal 4 (no N-tile sweep).
-- K must be a positive multiple of 4 (caller-enforced; `K_TILES = K / 4`).
+- PE array is 4×4 (parameterized but not yet exercised at 8×8 in tests).
+- No Conv2D driver (planned in phase 13 as Python im2col).
 
 Pipeline latency from each tile's `if_start` to first OFM write = 9 cycles
-(FSM startup + SRAM read + 4-deep PE column + 3-deep unskew). For `K_TILES > 1`
-the writer fires only on the last tile, so overall kick latency scales with
-`K_TILES * (LOAD_W_cycles + COMPUTE_cycles)`.
+(FSM startup + SRAM read + 4-deep PE column + 3-deep unskew). For
+`K_TILES > 1` the writer fires only on the last K tile of each N tile, so
+overall kick latency scales with
+`N_TILES * (WRITEBACK_cycles + K_TILES * (LOAD_W_cycles + COMPUTE_cycles))`.
 
 ## Test summary
 
-16 cocotb testbenches, 102 cases total. Run them all with `bash scripts/run_all.sh`.
+16 cocotb testbenches, 111 cases total. Run them all with `bash scripts/run_all.sh`.
 
 | Testbench | Cases | DUT |
 |-----------|-------|-----|
@@ -88,8 +103,8 @@ the writer fires only on the last tile, so overall kick latency scales with
 | `tb/test_req_param_loader/`  | 4 | `rtl/req_param_loader.sv` (+sram harness) |
 | `tb/test_bias_loader/`       | 5 | `rtl/bias_loader.sv` (+sram harness) |
 | `tb/test_apb_csr/`           | 7 | `rtl/apb_csr.sv` |
-| `tb/test_ctrl_fsm/`          | 9 | `rtl/ctrl_fsm.sv` (incl. K-tile loop) |
-| `tb/test_top/`               | 11 | `rtl/tinyNPU_top.sv` (incl. K=8, K=12) |
+| `tb/test_ctrl_fsm/`          | 12 | `rtl/ctrl_fsm.sv` (incl. K-tile + N-tile loops) |
+| `tb/test_top/`               | 17 | `rtl/tinyNPU_top.sv` (incl. K=8/12, N=8/16, full N+K nest) |
 
 ## Toolchain & setup
 
@@ -223,11 +238,10 @@ The strict rules live in `plan.md` §8. Highlights:
 
 ## Roadmap beyond v1
 
-Phases 11 through 14 are described in detail in `plan.md`. In short:
+Phases 12 through 14 are described in detail in `plan.md`. In short:
 
 | Phase | Headline goal | Effort |
 |-------|---------------|--------|
-| 11 | N-tile sweep (N > 4) + parameterized unskew | 1–2 d |
 | 12 | 8×8 PE array | 1–2 d |
 | 13 | Conv2D via Python im2col driver | 1 d |
 | 14 | Coverage + cycle-count benchmarking + CI | 1–2 d |

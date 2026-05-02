@@ -301,15 +301,17 @@ tinyNPU/
 
 ---
 
-### 阶段 11 — N 分块 + 通用 unskew
+### 阶段 11 — N 分块 + 通用 unskew （已完成）
 **目标**：解除 N 必须等于 4 的限制。
 
-- 把 top 内硬编码的 6 个 unskew 寄存器改为按 ROWS 参数化的 generate 实现。
-- `ctrl_fsm` 增加 N tile 外循环（每 tile 跑 K_TILES 个内循环）。
-- ofm_writer 写地址按 N tile 偏移。
-- 测试：`test_top` 加 N=8 / N=16 GEMM。
-
-预计：1–2 天。
+实际实现：
+- `tinyNPU_top` 把硬编码的 6 个 unskew 寄存器替换为 generate 实现：lane c 的延迟链长度 `COLS-1-c`，所有链 flatten 到一个 1D unpacked array `sk[N_STAGES]`，每个 cell 都被驱动并被读取（无 dead 寄存器）。lane c 输出 `sk[OFFSET(c) + STAGES(c) - 1]`，lane COLS-1 直通。
+- `ctrl_fsm` 新增 `n_tiles_total` 输入与 `n_tile_idx / n_first_tile / n_last_tile` 输出；状态流改为 `... COMPUTE → (last_tile? WRITEBACK : LOAD_W loop) → WRITEBACK → (n_last_tile? DONE : LOAD_W loop)`。`tile_idx_q` 在 `WRITEBACK→LOAD_W` 边沿（`!n_last_tile`）回到 0，让 `first_tile` 在每个 N tile 开头都为 1，使 LOAD_BIAS / LOAD_REQ 对每个 N tile 都重新触发。`n_tile_idx_q` 在同一边沿递增。`params_ok` 增加 `n_tiles_total != 0`。
+- `tinyNPU_top` 把 `w_base_tile` 改为寄存器：`+1` per `wl_done`（外 N、内 K 顺序自动产生 `w_base, w_base+1, ..., w_base + N_TILES*K_TILES - 1`）；`ifm_base_tile` 在 N tile 边界（`ow_done && !n_last_tile`）回到 `ifm_base`（A 跨 N tile 复用）；`bias_base_tile = bias_base + n_tile_idx`，`req_mult_base_tile = req_mult_base + n_tile_idx`，`req_shift_base_tile = req_shift_base + n_tile_idx`（每 N tile 一个 word）；`ofm_base_tile` 寄存器在数据侧 N tile 边界（`data_n_advance`）`+= m_count`。
+- 数据侧 tile 计数器：`data_tile_idx` 在 `data_done_pulse` 时递增并在 `k_tiles_total - 1` 时回卷，`data_n_tile_idx` 在回卷时递增。`row_accumulator.first_tile = data_first_tile`，`ofm_writer.data_valid = data_valid && data_last_tile`。
+- SRAM 布局约定（caller 责任）：W 按 `(n_tile, k_tile) → w_base + n*K_TILES + k`（外 N 内 K）；BIAS / REQ_MULT / REQ_SHIFT 每 N tile 一个 word，地址 `+ n_tile_idx`；OFM 每 N tile M 行连续放置（`ofm_base + n*M + i`）；IFM 仍 tile-major over K（A 跨 N tile 复用）。
+- 测试：`test_ctrl_fsm` 增至 12 cases（新增 `test_fsm_ntile_loop / test_fsm_ntile_with_bias_per_n / test_fsm_ntile_with_ktile`，`test_fsm_err_on_zero_dim` 加 `n_tiles_total=0` trial）；`test_top` 增至 17 cases（新增 `test_top_ntile_n8 / _n8_relu_req / _n8_bias_relu_req / _n8_per_channel / _n16 / _n8_ktile_k8_full`），其中 `_n8_ktile_k8_full` 同时打开 N tile (2)、K tile (2)、bias、ReLU、global requantize。
+- Verilator `--lint-only -Wall` 仍 0 警告。
 
 ---
 

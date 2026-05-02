@@ -1,7 +1,7 @@
 // ctrl_fsm.sv
-// Top-level orchestration FSM. Supports K-tile accumulation: one kick runs
-// k_tiles_total back-to-back tiles, each tile re-loading W and computing a
-// partial GEMM that the row_accumulator (in top) sums across tiles.
+// Top-level orchestration FSM. Two nested tile loops:
+//   - inner K-tile loop (k_tiles_total) accumulates partial sums per N tile
+//   - outer N-tile loop (n_tiles_total) sweeps across the columns of B
 //
 // IDLE -> [params_ok? LOAD_W : ERR]
 // LOAD_W -> [first_tile && bias_en?    LOAD_BIAS :
@@ -9,15 +9,20 @@
 //                                       COMPUTE]
 // LOAD_BIAS -> [pch_req_en? LOAD_REQ : COMPUTE]
 // LOAD_REQ  -> COMPUTE
-// COMPUTE   -> [last_tile?  WRITEBACK : LOAD_W]   <-- tile loop
-// WRITEBACK -> DONE -> IDLE  (or ERR -> IDLE)
+// COMPUTE   -> [last_tile?  WRITEBACK : LOAD_W]   <-- K tile loop
+// WRITEBACK -> [n_last_tile? DONE     : LOAD_W]   <-- N tile loop
+// DONE -> IDLE  (or ERR -> IDLE)
 //
-// tile_idx increments at every COMPUTE -> LOAD_W transition (i.e., at the
-// boundary between non-final tiles). first_tile = (tile_idx == 0).
-// last_tile  = (tile_idx == k_tiles_total - 1).
+// tile_idx (K tile index within current N tile) increments at COMPUTE -> LOAD_W
+// transitions and resets at WRITEBACK -> LOAD_W (i.e., at every N tile
+// boundary). first_tile=1 marks the first K tile of the current N tile, so
+// LOAD_BIAS / LOAD_REQ are entered once per N tile.
+//
+// n_tile_idx increments at WRITEBACK -> LOAD_W transitions.
 
 module ctrl_fsm #(
-    parameter int K_TILE_W = 8
+    parameter int K_TILE_W = 8,
+    parameter int N_TILE_W = 8
 )(
     input  logic                    clk,
     input  logic                    rst_n,
@@ -27,6 +32,7 @@ module ctrl_fsm #(
     input  logic [31:0]             n_count,
     input  logic [31:0]             k_count,
     input  logic [K_TILE_W-1:0]     k_tiles_total,
+    input  logic [N_TILE_W-1:0]     n_tiles_total,
     input  logic                    bias_en,
     input  logic                    pch_req_en,
 
@@ -44,6 +50,9 @@ module ctrl_fsm #(
     output logic [K_TILE_W-1:0]     tile_idx,
     output logic                    first_tile,
     output logic                    last_tile,
+    output logic [N_TILE_W-1:0]     n_tile_idx,
+    output logic                    n_first_tile,
+    output logic                    n_last_tile,
 
     output logic                    busy,
     output logic                    done,
@@ -63,14 +72,20 @@ module ctrl_fsm #(
 
     state_t state, state_n, state_d;
     logic [K_TILE_W-1:0] tile_idx_q;
+    logic [N_TILE_W-1:0] n_tile_idx_q;
 
     logic params_ok;
     assign params_ok = (m_count != 32'h0) && (n_count != 32'h0)
-                       && (k_count != 32'h0) && (k_tiles_total != {K_TILE_W{1'b0}});
+                       && (k_count != 32'h0)
+                       && (k_tiles_total != {K_TILE_W{1'b0}})
+                       && (n_tiles_total != {N_TILE_W{1'b0}});
 
-    assign tile_idx   = tile_idx_q;
-    assign first_tile = (tile_idx_q == {K_TILE_W{1'b0}});
-    assign last_tile  = (tile_idx_q == k_tiles_total - {{(K_TILE_W-1){1'b0}}, 1'b1});
+    assign tile_idx     = tile_idx_q;
+    assign first_tile   = (tile_idx_q == {K_TILE_W{1'b0}});
+    assign last_tile    = (tile_idx_q == k_tiles_total - {{(K_TILE_W-1){1'b0}}, 1'b1});
+    assign n_tile_idx   = n_tile_idx_q;
+    assign n_first_tile = (n_tile_idx_q == {N_TILE_W{1'b0}});
+    assign n_last_tile  = (n_tile_idx_q == n_tiles_total - {{(N_TILE_W-1){1'b0}}, 1'b1});
 
     always_ff @(posedge clk) begin
         if (!rst_n) state <= S_IDLE;
@@ -83,9 +98,16 @@ module ctrl_fsm #(
     end
 
     always_ff @(posedge clk) begin
-        if (!rst_n)                                              tile_idx_q <= {K_TILE_W{1'b0}};
-        else if (state == S_IDLE)                                tile_idx_q <= {K_TILE_W{1'b0}};
-        else if ((state == S_COMPUTE) && if_done && !last_tile)  tile_idx_q <= tile_idx_q + {{(K_TILE_W-1){1'b0}}, 1'b1};
+        if (!rst_n)                                                       tile_idx_q <= {K_TILE_W{1'b0}};
+        else if (state == S_IDLE)                                          tile_idx_q <= {K_TILE_W{1'b0}};
+        else if ((state == S_COMPUTE) && if_done && !last_tile)            tile_idx_q <= tile_idx_q + {{(K_TILE_W-1){1'b0}}, 1'b1};
+        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)        tile_idx_q <= {K_TILE_W{1'b0}};
+    end
+
+    always_ff @(posedge clk) begin
+        if (!rst_n)                                                       n_tile_idx_q <= {N_TILE_W{1'b0}};
+        else if (state == S_IDLE)                                          n_tile_idx_q <= {N_TILE_W{1'b0}};
+        else if ((state == S_WRITEBACK) && ow_done && !n_last_tile)        n_tile_idx_q <= n_tile_idx_q + {{(N_TILE_W-1){1'b0}}, 1'b1};
     end
 
     always_comb begin
@@ -117,10 +139,15 @@ module ctrl_fsm #(
                     else           state_n = S_LOAD_W;
                 end
             end
-            S_WRITEBACK: if (ow_done) state_n = S_DONE;
-            S_DONE:                   state_n = S_IDLE;
-            S_ERR:                    state_n = S_IDLE;
-            default:                  state_n = S_IDLE;
+            S_WRITEBACK: begin
+                if (ow_done) begin
+                    if (n_last_tile) state_n = S_DONE;
+                    else             state_n = S_LOAD_W;
+                end
+            end
+            S_DONE:  state_n = S_IDLE;
+            S_ERR:   state_n = S_IDLE;
+            default: state_n = S_IDLE;
         endcase
     end
 

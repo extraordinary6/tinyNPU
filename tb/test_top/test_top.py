@@ -2,7 +2,7 @@
 
 Flow per test:
   1. backdoor-load A into IFM SRAM (each addr stores one ROWS x INT8 row)
-  2. backdoor-load W tile into W SRAM at one address (ROWS*COLS x INT8 packed)
+  2. backdoor-load W tile(s) into W SRAM (per-(n_tile, k_tile) ROWS*COLS x INT8 packed)
   3. APB writes M, N, K, base addresses, FLAGS, REQ_MULT, REQ_SHIFT
   4. APB writes CTRL[0]=1 to start
   5. poll busy until 0 (engine returned to IDLE)
@@ -175,7 +175,7 @@ async def read_ofm(dut, addr):
     return int(dut.bd_ofm_rdata.value)
 
 
-async def wait_done(dut, max_cycles=200):
+async def wait_done(dut, max_cycles=400):
     for _ in range(max_cycles):
         await RisingEdge(dut.pclk)
         await Timer(SETTLE_NS, units="ns")
@@ -606,4 +606,265 @@ async def test_top_ktile_k8_bias_relu_req(dut):
         assert got == exp, f"K=8+bias row {i}: got={got} expected={exp}"
 
 
+# ----------------------------------------------------------------------
+# Phase 11: N-tile sweep helpers
+# ----------------------------------------------------------------------
 
+async def load_w_full(dut, W, w_base):
+    """Load W[K, N] into W SRAM. Layout: tile (n_tile, k_tile) at
+    w_base + n_tile*K_TILES + k_tile, slab W[k*ROWS:(k+1)*ROWS, n*COLS:(n+1)*COLS]."""
+    K, N = W.shape
+    K_TILES = K // ROWS
+    N_TILES = N // COLS
+    for n_tile in range(N_TILES):
+        for k_tile in range(K_TILES):
+            slab = W[k_tile * ROWS : (k_tile + 1) * ROWS,
+                     n_tile * COLS : (n_tile + 1) * COLS]
+            dut.bd_w_we.value = 1
+            dut.bd_w_addr.value = w_base + n_tile * K_TILES + k_tile
+            dut.bd_w_wdata.value = pack_w_tile(slab)
+            await RisingEdge(dut.pclk)
+    dut.bd_w_we.value = 0
+    await Timer(SETTLE_NS, units="ns")
+
+
+async def load_bias_full(dut, bias, bias_base):
+    """Load length-N bias array as N_TILES words at bias_base + n_tile."""
+    N = len(bias)
+    N_TILES = N // COLS
+    for n_tile in range(N_TILES):
+        slab = bias[n_tile * COLS : (n_tile + 1) * COLS]
+        dut.bd_bias_we.value = 1
+        dut.bd_bias_addr.value = bias_base + n_tile
+        dut.bd_bias_wdata.value = pack_bias_word(slab)
+        await RisingEdge(dut.pclk)
+    dut.bd_bias_we.value = 0
+    await Timer(SETTLE_NS, units="ns")
+
+
+async def load_pch_full(dut, mults, shifts, mult_base, shift_base):
+    """Per-channel mult and shift arrays of length N: one word per N tile."""
+    N = len(mults)
+    N_TILES = N // COLS
+    for n_tile in range(N_TILES):
+        m_slab = mults[n_tile * COLS : (n_tile + 1) * COLS]
+        s_slab = shifts[n_tile * COLS : (n_tile + 1) * COLS]
+        await load_w_word(dut, addr=mult_base + n_tile, packed=pack_w_mults(m_slab))
+        await load_w_word(dut, addr=shift_base + n_tile, packed=pack_w_shifts(s_slab))
+
+
+async def read_ofm_full(dut, ofm_base, M, N):
+    """Read M x N output back. Tile n's M rows live at ofm_base + n*M + i."""
+    out = np.zeros((M, N), dtype=np.int8)
+    N_TILES = N // COLS
+    for n_tile in range(N_TILES):
+        for i in range(M):
+            raw = await read_ofm(dut, ofm_base + n_tile * M + i)
+            row = unpack_ofm_row(raw)
+            for c in range(COLS):
+                out[i, n_tile * COLS + c] = row[c]
+    return out
+
+
+@cocotb.test()
+async def test_top_ntile_n8(dut):
+    """N=8 GEMM (two N tiles), K=4. Raw INT32 low-byte output."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_8)
+    M = 4
+    N = 8
+    K = 4
+    A = rng.integers(-8, 8, size=(M, K), dtype=np.int8)
+    W = rng.integers(-8, 8, size=(K, N), dtype=np.int8)
+
+    # K=4 -> single K tile, so IFM layout is the simple flat one (M rows).
+    await load_ifm(dut, A, base=0)
+    await load_w_full(dut, W, w_base=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x40,
+                    flags=0, req_mult=1, req_shift=0)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    out_u8 = (acc & 0xFF).astype(np.uint8)
+    expected = np.where(out_u8 & 0x80, out_u8.astype(np.int16) - 256, out_u8).astype(np.int8)
+    got = await read_ofm_full(dut, 0x40, M, N)
+    np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_ntile_n8_relu_req(dut):
+    """N=8 GEMM + ReLU + global requantize."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_8C)
+    M = 4
+    N = 8
+    K = 4
+    A = rng.integers(-32, 32, size=(M, K), dtype=np.int8)
+    W = rng.integers(-32, 32, size=(K, N), dtype=np.int8)
+    req_mult = 1 << 18
+    req_shift = 18
+
+    await load_ifm(dut, A, base=0)
+    await load_w_full(dut, W, w_base=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x60,
+                    flags=0b0110,
+                    req_mult=req_mult, req_shift=req_shift)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    acc = model_bias_relu(acc, None, bias_en=False, relu_en=True)
+    expected = model_req(acc, int(req_mult), int(req_shift)).astype(np.int8)
+    got = await read_ofm_full(dut, 0x60, M, N)
+    np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_ntile_n8_bias_relu_req(dut):
+    """N=8 GEMM + per-N-tile bias + ReLU + global requantize."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_88)
+    M = 4
+    N = 8
+    K = 4
+    A = rng.integers(-16, 16, size=(M, K), dtype=np.int8)
+    W = rng.integers(-16, 16, size=(K, N), dtype=np.int8)
+    bias = [int(v) for v in rng.integers(-300, 300, size=N, dtype=np.int32)]
+    req_mult = 1 << 18
+    req_shift = 18
+    bias_addr = 0x10
+
+    await load_ifm(dut, A, base=0)
+    await load_w_full(dut, W, w_base=0)
+    await load_bias_full(dut, bias, bias_base=bias_addr)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x80,
+                    flags=0b0111,
+                    req_mult=req_mult, req_shift=req_shift,
+                    bias_base=bias_addr)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    bias_vec = np.array(bias, dtype=np.int32)
+    bias_bcast = np.broadcast_to(bias_vec, acc.shape)
+    acc = model_bias_relu(acc, bias_bcast, bias_en=True, relu_en=True)
+    expected = model_req(acc, int(req_mult), int(req_shift)).astype(np.int8)
+    got = await read_ofm_full(dut, 0x80, M, N)
+    np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_ntile_n8_per_channel(dut):
+    """N=8 GEMM + per-channel requantize (mult/shift loaded per N tile from W SRAM)."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_C0)
+    M = 4
+    N = 8
+    K = 4
+    A = rng.integers(-32, 32, size=(M, K), dtype=np.int8)
+    W = rng.integers(-32, 32, size=(K, N), dtype=np.int8)
+    mults = [(1 << 18), (1 << 19), -(1 << 18), (1 << 17),
+             (1 << 20), -(1 << 19), (1 << 18), (1 << 16)]
+    shifts = [12, 14, 11, 10, 15, 13, 12, 9]
+
+    # W SRAM layout: weight tiles at w_base..w_base + N_TILES*K_TILES - 1,
+    # then mult words at mult_base..mult_base + N_TILES - 1, then shift
+    # words at shift_base..shift_base + N_TILES - 1.
+    N_TILES = N // COLS
+    K_TILES = K // ROWS
+    w_base = 0
+    mult_base = w_base + N_TILES * K_TILES
+    shift_base = mult_base + N_TILES
+
+    await load_ifm(dut, A, base=0)
+    await load_w_full(dut, W, w_base=w_base)
+    await load_pch_full(dut, mults, shifts, mult_base=mult_base, shift_base=shift_base)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=w_base, ofm_base=0xA0,
+                    flags=0b1100,
+                    req_mult=0, req_shift=0,
+                    req_mult_base=mult_base, req_shift_base=shift_base)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    expected = model_req_pc(acc, mults, shifts)
+    got = await read_ofm_full(dut, 0xA0, M, N)
+    np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_ntile_n16(dut):
+    """N=16 GEMM (four N tiles), K=4. Larger N sweep, no extras."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_F)
+    M = 2
+    N = 16
+    K = 4
+    A = rng.integers(-4, 4, size=(M, K), dtype=np.int8)
+    W = rng.integers(-4, 4, size=(K, N), dtype=np.int8)
+
+    await load_ifm(dut, A, base=0)
+    await load_w_full(dut, W, w_base=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x40,
+                    flags=0, req_mult=1, req_shift=0)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    out_u8 = (acc & 0xFF).astype(np.uint8)
+    expected = np.where(out_u8 & 0x80, out_u8.astype(np.int16) - 256, out_u8).astype(np.int8)
+    got = await read_ofm_full(dut, 0x40, M, N)
+    np.testing.assert_array_equal(got, expected)
+
+
+@cocotb.test()
+async def test_top_ntile_n8_ktile_k8_full(dut):
+    """N=8, K=8, M=4 — nested N+K loops, with bias + ReLU + global requantize."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+
+    rng = np.random.default_rng(0x11E_AB)
+    M = 4
+    N = 8
+    K = 8
+    A = rng.integers(-16, 16, size=(M, K), dtype=np.int8)
+    W = rng.integers(-16, 16, size=(K, N), dtype=np.int8)
+    bias = [int(v) for v in rng.integers(-300, 300, size=N, dtype=np.int32)]
+    req_mult = 1 << 18
+    req_shift = 22
+    bias_addr = 0x20
+
+    await load_ifm_ktile(dut, A, ifm_base=0, M=M)
+    await load_w_full(dut, W, w_base=0)
+    await load_bias_full(dut, bias, bias_base=bias_addr)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x60,
+                    flags=0b0111,
+                    req_mult=req_mult, req_shift=req_shift,
+                    bias_base=bias_addr)
+    await kick(dut)
+    await wait_done(dut)
+
+    acc = gemm_i8(A, W)
+    bias_vec = np.array(bias, dtype=np.int32)
+    bias_bcast = np.broadcast_to(bias_vec, acc.shape)
+    acc = model_bias_relu(acc, bias_bcast, bias_en=True, relu_en=True)
+    expected = model_req(acc, int(req_mult), int(req_shift)).astype(np.int8)
+    got = await read_ofm_full(dut, 0x60, M, N)
+    np.testing.assert_array_equal(got, expected)

@@ -1,34 +1,46 @@
 // tinyNPU_top.sv
 // Top-level integration. APB3-controlled GEMM with optional bias / ReLU /
-// (per-channel) requantize, and K-tile accumulation across multiple weight
-// tiles.
+// (per-channel) requantize, K-tile accumulation across multiple weight
+// tiles, and N-tile sweep across multiple column blocks.
 //
 // Datapath: ifm_feeder -> systolic_array -> unskew -> row_accumulator
 //           -> bias_relu -> requantize -> ofm_writer.
-// Control:  apb_csr (CSR file) drives ctrl_fsm; ctrl_fsm sequences
-//           weight_loader (LOAD_W), optional bias_loader (LOAD_BIAS),
-//           optional req_param_loader (LOAD_REQ), then ifm_feeder + ofm_writer.
-//           For K > KCOLS=COLS, ctrl_fsm loops LOAD_W <-> COMPUTE
-//           k_tiles_total = K/COLS times before WRITEBACK.
+// Control:  apb_csr (CSR file) drives ctrl_fsm. ctrl_fsm runs an outer
+//           N-tile loop and an inner K-tile loop. For each N tile it loops
+//           LOAD_W <-> COMPUTE k_tiles_total times accumulating partial
+//           sums; on the first K tile of every N tile it optionally runs
+//           LOAD_BIAS (if bias_en) and LOAD_REQ (if pch_req_en); on the
+//           last K tile it runs WRITEBACK.
 //
 // SRAM layout (caller responsibility):
-//   IFM SRAM: A[M, K] split tile-major. Tile k slice A[:, k*COLS:(k+1)*COLS]
-//             stored at addresses ifm_base + k*M ... + (k+1)*M - 1.
-//   W   SRAM: tile k weight slab B[k*COLS:(k+1)*COLS, 0:COLS] at w_base + k.
-//   OFM SRAM: M output rows at ofm_base + 0 ... + M-1.
+//   IFM SRAM: A[M, K] tile-major over K. Tile k slice A[:, k*COLS:(k+1)*COLS]
+//             at addresses ifm_base + k*M ... + (k+1)*M - 1. Reused across
+//             every N tile.
+//   W   SRAM: weight tile (n_tile, k_tile) — slab
+//             B[k*COLS:(k+1)*COLS, n*COLS:(n+1)*COLS] — at address
+//             w_base + n*K_TILES + k. Outer N, inner K (matches the
+//             sequential w_base_tile counter).
+//   BIAS SRAM: one COLS x INT32 word per N tile, at bias_base + n_tile_idx.
+//   REQ SRAM (in W SRAM): one mult word + one shift word per N tile, at
+//             req_mult_base + n_tile_idx and req_shift_base + n_tile_idx.
+//   OFM SRAM: tile-major over N. Tile n's M output rows at addresses
+//             ofm_base + n*M ... + (n+1)*M - 1.
 //
-// Pipeline latency from if_start to first data_valid into ofm_writer = 9.
+// Pipeline latency from each tile's if_start to first OFM write = 9
+// (FSM startup + SRAM read + 4-deep PE column + 3-deep unskew). The
+// ofm_writer fires only on the last K tile of each N tile.
 
 module tinyNPU_top #(
-    parameter int ROWS   = 4,
-    parameter int COLS   = 4,
-    parameter int A_W    = 8,
-    parameter int O_W    = 8,
-    parameter int P_W    = 32,
-    parameter int ADDR_W = 12,
-    parameter int M_W    = 16,
-    parameter int M_MAX  = 64,
-    parameter int K_TILE_W = 8
+    parameter int ROWS     = 4,
+    parameter int COLS     = 4,
+    parameter int A_W      = 8,
+    parameter int O_W      = 8,
+    parameter int P_W      = 32,
+    parameter int ADDR_W   = 12,
+    parameter int M_W      = 16,
+    parameter int M_MAX    = 64,
+    parameter int K_TILE_W = 8,
+    parameter int N_TILE_W = 8
 )(
     input  logic                          pclk,
     input  logic                          presetn,
@@ -104,15 +116,21 @@ module tinyNPU_top #(
     logic                    ow_start_int, ow_done;
     logic [K_TILE_W-1:0]     tile_idx;
     logic                    first_tile, last_tile;
+    logic [N_TILE_W-1:0]     n_tile_idx;
+    logic                    n_first_tile, n_last_tile;
     logic [K_TILE_W-1:0]     k_tiles_total;
+    logic [N_TILE_W-1:0]     n_tiles_total;
 
-    // K must be a multiple of COLS; software is responsible. k_tiles_total =
-    // k_count_w / COLS = k_count_w >> $clog2(COLS).
+    // K must be a multiple of COLS, N must be a multiple of COLS; software
+    // is responsible. k_tiles_total = k_count >> $clog2(COLS),
+    // n_tiles_total = n_count >> $clog2(COLS).
     localparam int LOG2_COLS = $clog2(COLS);
     assign k_tiles_total = k_count_w[LOG2_COLS +: K_TILE_W];
+    assign n_tiles_total = n_count_w[LOG2_COLS +: N_TILE_W];
 
     ctrl_fsm #(
-        .K_TILE_W (K_TILE_W)
+        .K_TILE_W (K_TILE_W),
+        .N_TILE_W (N_TILE_W)
     ) u_fsm (
         .clk           (pclk),
         .rst_n         (presetn),
@@ -121,6 +139,7 @@ module tinyNPU_top #(
         .n_count       (n_count_w),
         .k_count       (k_count_w),
         .k_tiles_total (k_tiles_total),
+        .n_tiles_total (n_tiles_total),
         .bias_en       (flags_w[0]),
         .pch_req_en    (flags_w[3]),
         .wl_start      (wl_start),
@@ -136,26 +155,46 @@ module tinyNPU_top #(
         .tile_idx      (tile_idx),
         .first_tile    (first_tile),
         .last_tile     (last_tile),
+        .n_tile_idx    (n_tile_idx),
+        .n_first_tile  (n_first_tile),
+        .n_last_tile   (n_last_tile),
         .busy          (busy),
         .done          (done),
         .err           (err)
     );
 
     // ---------------- per-tile address computation ----------------
-    // weight_loader: each tile is exactly one address (one packed ROWS*COLS*A_W word).
+    // weight_loader: every (n_tile, k_tile) pair occupies one packed word.
+    // Counter advances once per wl_done, so the addresses are issued in
+    // outer-N inner-K order: w_base, w_base+1, ... w_base + (N_TILES*K_TILES - 1).
     logic [ADDR_W-1:0] w_base_tile;
-    assign w_base_tile = w_base_w[ADDR_W-1:0]
-                         + {{(ADDR_W-K_TILE_W){1'b0}}, tile_idx};
+    always_ff @(posedge pclk) begin
+        if (!presetn)         w_base_tile <= {ADDR_W{1'b0}};
+        else if (start_pulse) w_base_tile <= w_base_w[ADDR_W-1:0];
+        else if (wl_done)     w_base_tile <= w_base_tile + {{(ADDR_W-1){1'b0}}, 1'b1};
+    end
 
-    // ifm_feeder: each tile occupies M consecutive addresses. Track an offset
-    // register that resets at the start of a kick and advances by m_count
-    // when entering a non-first tile's COMPUTE.
+    // ifm_feeder: each K tile occupies M consecutive addresses. Track an
+    // offset register that resets at the start of a kick AND at every
+    // N-tile boundary (since A is reused across N tiles), and advances by
+    // m_count when entering a non-first K tile's COMPUTE.
     logic [ADDR_W-1:0] ifm_base_tile;
     always_ff @(posedge pclk) begin
-        if (!presetn)                           ifm_base_tile <= {ADDR_W{1'b0}};
-        else if (start_pulse)                   ifm_base_tile <= ifm_base_w[ADDR_W-1:0];
-        else if (if_start && !first_tile)       ifm_base_tile <= ifm_base_tile + m_count_w[ADDR_W-1:0];
+        if (!presetn)                              ifm_base_tile <= {ADDR_W{1'b0}};
+        else if (start_pulse)                       ifm_base_tile <= ifm_base_w[ADDR_W-1:0];
+        else if (ow_done && !n_last_tile)           ifm_base_tile <= ifm_base_w[ADDR_W-1:0];
+        else if (if_start && !first_tile)           ifm_base_tile <= ifm_base_tile + m_count_w[ADDR_W-1:0];
     end
+
+    // bias_loader / req_param_loader: one address per N tile. Use formula
+    // (n_tile_idx changes only at WRITEBACK->LOAD_W edges, well before the
+    // loaders sample base_addr in their FETCH state).
+    logic [ADDR_W-1:0] bias_base_tile;
+    logic [ADDR_W-1:0] req_mult_base_tile;
+    logic [ADDR_W-1:0] req_shift_base_tile;
+    assign bias_base_tile      = bias_base_w[ADDR_W-1:0]      + {{(ADDR_W-N_TILE_W){1'b0}}, n_tile_idx};
+    assign req_mult_base_tile  = req_mult_base_w[ADDR_W-1:0]  + {{(ADDR_W-N_TILE_W){1'b0}}, n_tile_idx};
+    assign req_shift_base_tile = req_shift_base_w[ADDR_W-1:0] + {{(ADDR_W-N_TILE_W){1'b0}}, n_tile_idx};
 
     // ---------------- weight_loader ----------------
     logic                            w_load_pulse;
@@ -197,8 +236,8 @@ module tinyNPU_top #(
         .clk             (pclk),
         .rst_n           (presetn),
         .start           (rp_start),
-        .mult_base_addr  (req_mult_base_w[ADDR_W-1:0]),
-        .shift_base_addr (req_shift_base_w[ADDR_W-1:0]),
+        .mult_base_addr  (req_mult_base_tile),
+        .shift_base_addr (req_shift_base_tile),
         .sram_en         (rp_sram_en),
         .sram_addr       (rp_sram_addr),
         .sram_rdata      (w_sram_rdata),
@@ -223,7 +262,7 @@ module tinyNPU_top #(
         .clk        (pclk),
         .rst_n      (presetn),
         .start      (bl_start),
-        .base_addr  (bias_base_w[ADDR_W-1:0]),
+        .base_addr  (bias_base_tile),
         .sram_en    (bias_sram_en),
         .sram_addr  (bias_sram_addr),
         .sram_rdata (bias_sram_rdata),
@@ -272,42 +311,35 @@ module tinyNPU_top #(
         .psum_out (sys_psum)
     );
 
-    // ---------------- unskew (ROWS=4 hard-wired shift register chains) ----------------
-    // lane 0: 3 stages, lane 1: 2 stages, lane 2: 1 stage, lane 3: passthrough.
-    logic [P_W-1:0] sk0_s0, sk0_s1, sk0_s2;
-    logic [P_W-1:0] sk1_s0, sk1_s1;
-    logic [P_W-1:0] sk2_s0;
-
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk0_s0 <= {P_W{1'b0}};
-        else          sk0_s0 <= sys_psum[0*P_W +: P_W];
-    end
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk0_s1 <= {P_W{1'b0}};
-        else          sk0_s1 <= sk0_s0;
-    end
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk0_s2 <= {P_W{1'b0}};
-        else          sk0_s2 <= sk0_s1;
-    end
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk1_s0 <= {P_W{1'b0}};
-        else          sk1_s0 <= sys_psum[1*P_W +: P_W];
-    end
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk1_s1 <= {P_W{1'b0}};
-        else          sk1_s1 <= sk1_s0;
-    end
-    always_ff @(posedge pclk) begin
-        if (!presetn) sk2_s0 <= {P_W{1'b0}};
-        else          sk2_s0 <= sys_psum[2*P_W +: P_W];
-    end
-
+    // ---------------- unskew (parameterized over COLS) ----------------
+    // Lane c (c < COLS-1) is delayed by (COLS-1-c) cycles; lane COLS-1 is
+    // a passthrough. Implemented as one shift register per lane, packed
+    // contiguously into a single 1D unpacked array sk to keep all storage
+    // cells driven and read.
+    localparam int N_STAGES = (COLS - 1) * COLS / 2;
+    logic [P_W-1:0] sk [0:N_STAGES-1];
     logic [COLS*P_W-1:0] psum_unskewed;
-    assign psum_unskewed[0*P_W +: P_W] = sk0_s2;
-    assign psum_unskewed[1*P_W +: P_W] = sk1_s1;
-    assign psum_unskewed[2*P_W +: P_W] = sk2_s0;
-    assign psum_unskewed[3*P_W +: P_W] = sys_psum[3*P_W +: P_W];
+
+    genvar uc, us;
+    generate
+        for (uc = 0; uc < COLS - 1; uc++) begin : g_unskew_lane
+            localparam int OFFSET = uc * (COLS - 1) - uc * (uc - 1) / 2;
+            localparam int STAGES = COLS - 1 - uc;
+
+            always_ff @(posedge pclk) begin
+                if (!presetn) sk[OFFSET] <= {P_W{1'b0}};
+                else          sk[OFFSET] <= sys_psum[uc*P_W +: P_W];
+            end
+            for (us = 1; us < STAGES; us++) begin : g_unskew_stage
+                always_ff @(posedge pclk) begin
+                    if (!presetn) sk[OFFSET + us] <= {P_W{1'b0}};
+                    else          sk[OFFSET + us] <= sk[OFFSET + us - 1];
+                end
+            end
+            assign psum_unskewed[uc*P_W +: P_W] = sk[OFFSET + STAGES - 1];
+        end
+    endgenerate
+    assign psum_unskewed[(COLS-1)*P_W +: P_W] = sys_psum[(COLS-1)*P_W +: P_W];
 
     // ---------------- valid_gen FSM (per-tile data_valid window) ----------------
     typedef enum logic [1:0] {
@@ -351,26 +383,51 @@ module tinyNPU_top #(
     logic data_valid;
     assign data_valid = (vg_state == VG_VAL);
 
-    // ---------------- data-side tile counter ----------------
-    // ctrl_fsm.first_tile flips on the if_done edge, but valid_gen's data
-    // window for tile k can extend a few cycles past if_done (the unskew
-    // tail). Track tile boundaries on the valid_gen side so the
-    // row_accumulator sees first_tile=1 for the entire span of tile 0's
-    // M-row data window.
+    // ---------------- data-side tile counters ----------------
+    // ctrl_fsm.first_tile / last_tile flip on if_done edges (control side),
+    // but the corresponding data window (after the unskew tail) extends a
+    // few cycles past if_done. Track tile boundaries on the valid_gen side
+    // so row_accumulator and ofm_writer see consistent first/last edges
+    // across the M-row data window of the relevant tile.
+    //
+    // data_tile_idx wraps back to 0 at every k_tiles_total-th data window
+    // (i.e., at every N tile boundary). data_n_tile_idx increments at the
+    // same edge.
     logic data_done_pulse;
     assign data_done_pulse = (vg_state == VG_VAL) && (vg_state_n == VG_IDLE);
 
     logic [K_TILE_W-1:0] data_tile_idx;
+    logic [N_TILE_W-1:0] data_n_tile_idx;
+    logic                data_n_advance;
+
+    assign data_n_advance = data_done_pulse
+                            && (data_tile_idx == k_tiles_total - {{(K_TILE_W-1){1'b0}}, 1'b1});
+
     always_ff @(posedge pclk) begin
         if (!presetn)             data_tile_idx <= {K_TILE_W{1'b0}};
         else if (start_pulse)     data_tile_idx <= {K_TILE_W{1'b0}};
+        else if (data_n_advance)  data_tile_idx <= {K_TILE_W{1'b0}};
         else if (data_done_pulse) data_tile_idx <= data_tile_idx + {{(K_TILE_W-1){1'b0}}, 1'b1};
+    end
+
+    always_ff @(posedge pclk) begin
+        if (!presetn)            data_n_tile_idx <= {N_TILE_W{1'b0}};
+        else if (start_pulse)    data_n_tile_idx <= {N_TILE_W{1'b0}};
+        else if (data_n_advance) data_n_tile_idx <= data_n_tile_idx + {{(N_TILE_W-1){1'b0}}, 1'b1};
     end
 
     logic data_first_tile;
     logic data_last_tile;
     assign data_first_tile = (data_tile_idx == {K_TILE_W{1'b0}});
     assign data_last_tile  = (data_tile_idx == k_tiles_total - {{(K_TILE_W-1){1'b0}}, 1'b1});
+
+    // ofm_base_tile: advances by m_count at every data-side N-tile boundary.
+    logic [ADDR_W-1:0] ofm_base_tile;
+    always_ff @(posedge pclk) begin
+        if (!presetn)            ofm_base_tile <= {ADDR_W{1'b0}};
+        else if (start_pulse)    ofm_base_tile <= ofm_base_w[ADDR_W-1:0];
+        else if (data_n_advance) ofm_base_tile <= ofm_base_tile + m_count_w[ADDR_W-1:0];
+    end
 
     // ---------------- row index for accumulator ----------------
     logic [M_W-1:0] row_idx;
@@ -442,11 +499,10 @@ module tinyNPU_top #(
     );
 
     // ---------------- ofm_writer ----------------
-    // Writer fires only on the LAST tile's data_valid window. start gated
-    // by data_last_tile (which lags ctrl_fsm.last_tile by the same span as
-    // data_first_tile lags ctrl_fsm.first_tile, so it tracks the actual
-    // accumulated-result window). Earlier tiles flow into row_accumulator
-    // only — ofm_writer stays in IDLE.
+    // Fires on the LAST K tile of every N tile. start gated by ctrl_fsm's
+    // last_tile (control-side); data_valid gated by data_last_tile (data-side
+    // counter, lags last_tile by the unskew tail). Earlier K tiles flow
+    // into row_accumulator only.
     logic ow_busy_unused;
     logic ow_start_pulse;
     logic ow_data_valid;
@@ -464,7 +520,7 @@ module tinyNPU_top #(
         .rst_n      (presetn),
         .start      (ow_start_pulse),
         .m_count    (m_count_w[M_W-1:0]),
-        .base_addr  (ofm_base_w[ADDR_W-1:0]),
+        .base_addr  (ofm_base_tile),
         .data_in    (req_out),
         .data_valid (ow_data_valid),
         .sram_we    (ofm_sram_we),
@@ -476,8 +532,9 @@ module tinyNPU_top #(
 
     // ---------------- intentionally unused signal taps ----------------
     // CSR registers are 32 bits per APB convention but internal ADDR_W is
-    // smaller; FLAGS uses only [3:0]; REQ_SHIFT uses only [5:0]; k_count
-    // upper bits beyond what k_tiles_total uses are unused.
+    // smaller; FLAGS uses only [3:0]; REQ_SHIFT uses only [5:0]; k_count and
+    // n_count upper bits beyond what {k,n}_tiles_total use are unused; the
+    // ctrl_fsm exposes tile_idx / n_first_tile that aren't consumed in top.
     /* verilator lint_off UNUSEDSIGNAL */
     logic _unused_ok;
     assign _unused_ok = &{1'b0,
@@ -491,6 +548,8 @@ module tinyNPU_top #(
                           req_shift_w[31:6],
                           k_count_w[31:LOG2_COLS+K_TILE_W],
                           k_count_w[LOG2_COLS-1:0],
+                          n_count_w[31:LOG2_COLS+N_TILE_W],
+                          n_count_w[LOG2_COLS-1:0],
                           m_count_w[31:M_W],
                           wl_busy_unused,
                           bl_busy_unused,
@@ -498,7 +557,8 @@ module tinyNPU_top #(
                           if_busy_unused,
                           ow_busy_unused,
                           ow_start_int,
-                          tile_idx};
+                          tile_idx,
+                          n_first_tile};
     /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule
