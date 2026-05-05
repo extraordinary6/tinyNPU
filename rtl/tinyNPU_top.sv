@@ -550,7 +550,7 @@ module tinyNPU_top #(
     // smaller; FLAGS uses only [3:0]; REQ_SHIFT uses only [5:0]; k_count and
     // n_count upper bits beyond what {k,n}_tiles_total use are unused; the
     // ctrl_fsm exposes tile_idx / n_first_tile that aren't consumed in top.
-    /* verilator lint_off UNUSEDSIGNAL */
+    /* verilator lint_off UNUSED */
     logic _unused_ok;
     assign _unused_ok = &{1'b0,
                           ifm_base_w[31:ADDR_W],
@@ -575,6 +575,6 @@ module tinyNPU_top #(
                           ow_start_int,
                           tile_idx,
                           n_first_tile};
-    /* verilator lint_on UNUSEDSIGNAL */
+    /* verilator lint_on UNUSED */
 
 endmodule

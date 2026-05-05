@@ -60,9 +60,9 @@ module row_accumulator #(
     assign acc_out = sum_value;
 
     // M_W high bits of row_idx are intentionally ignored (idx is RA_W bits).
-    /* verilator lint_off UNUSEDSIGNAL */
+    /* verilator lint_off UNUSED */
     logic _unused_ok;
     assign _unused_ok = &{1'b0, row_idx[M_W-1:RA_W]};
-    /* verilator lint_on UNUSEDSIGNAL */
+    /* verilator lint_on UNUSED */
 
 endmodule
