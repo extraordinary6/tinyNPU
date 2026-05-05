@@ -12,12 +12,13 @@ For full architectural detail and per-phase milestones, see [`plan.md`](./plan.m
 
 ## Status
 
-Phase 0 through 12 are complete. The full datapath runs GEMM with arbitrary
+Phase 0 through 13 are complete. The full datapath runs GEMM with arbitrary
 M, arbitrary K (multiple of `COLS`) accumulated across multiple weight tiles,
 and arbitrary N (multiple of `COLS`) swept across multiple column blocks;
 optional bias, ReLU, and TFLite-lite requantize (global or per-channel) all
 driven through the APB3 CSR interface. The PE array is parameterized — the
-4×4 reference and an 8×8 instance are both verified end-to-end.
+4×4 reference and an 8×8 instance are both verified end-to-end. Conv2D is
+supported via a software im2col driver on top of the unmodified GEMM engine.
 
 | Phase | Content | State |
 |-------|---------|-------|
@@ -34,7 +35,8 @@ driven through the APB3 CSR interface. The PE array is parameterized — the
 | 10 | K-tile accumulation (`row_accumulator.sv`, K > 4) | done |
 | 11 | N-tile sweep (N > 4) + parameterized unskew | done |
 | 12 | 8×8 PE array (parameterized valid_gen, drain-aware ctrl_fsm, 8×8 testbench) | done |
-| 13+ | Conv2D / coverage | planned (`plan.md` §13+) |
+| 13 | Conv2D via software im2col (`tb/common/im2col.py`, `tb/test_conv/`) | done |
+| 14 | Cycle-count sweeps, perf.md, GitHub Actions CI | done |
 
 ### Capabilities (after phase 11)
 
@@ -74,9 +76,28 @@ driven through the APB3 CSR interface. The PE array is parameterized — the
 - OFM SRAM: tile-major over N. N-tile `n`'s `M` output rows at addresses
   `OFM_BASE + n*M ... + n*M + M-1`.
 
-### Known limitations (addressed by phases 13+)
+### Conv2D via software im2col
 
-- No Conv2D driver (planned in phase 13 as Python im2col).
+Conv2D is not a hardware operator — it is run entirely in software on top of
+the existing GEMM engine. `tb/common/im2col.py` exposes:
+
+- `im2col(ifm, kh, kw, stride, padding)` → `A[H'·W', kh·kw·Cin]` (row-major
+  patches in (i, j) output order, each patch flattened in (ki, kj, ci) order).
+- `kernel_to_b(kernel)` → `B[kh·kw·Cin, Cout]` with matching axis order.
+- `output_shape(H, W, kh, kw, stride, padding)` → `(H', W')`.
+- `conv2d_via_gemm(ifm, kernel, …)` → INT32 `[H', W', Cout]` via im2col + matmul.
+- `conv2d_reference(ifm, kernel, …)` → independent nested-loop reference (no
+  scipy dependency, kept Py3.7 / `numpy<1.22` compatible) used as the
+  cross-check golden.
+
+`tb/test_conv/` reuses the standard 4×4 `top_harness.sv` and pushes the
+`(A, B)` pair through the same backdoor SRAM ports as `tb/test_top/`. The
+caller-side constraints carry over: `Cout` (= `N`) and `kh·kw·Cin` (= `K`)
+must each be multiples of `COLS = 4`. Coverage spans single/multi K-tile,
+single/multi N-tile, `stride > 1`, `padding > 0`, ReLU, global and
+per-channel requantize, and bias.
+
+### Pipeline latency
 
 Pipeline latency from each tile's `if_start` to first OFM write =
 `ROWS + COLS + 1` cycles (FSM startup + SRAM read + PE column depth +
@@ -90,7 +111,7 @@ of each N tile, so overall kick latency scales with
 
 ## Test summary
 
-17 cocotb testbenches, 109 cases total. Run them all with `bash scripts/run_all.sh`.
+18 cocotb testbenches, 125 cases total. Run them all with `bash scripts/run_all.sh`.
 
 | Testbench | Cases | DUT |
 |-----------|-------|-----|
@@ -109,8 +130,9 @@ of each N tile, so overall kick latency scales with
 | `tb/test_bias_loader/`       | 5 | `rtl/bias_loader.sv` (+sram harness) |
 | `tb/test_apb_csr/`           | 7 | `rtl/apb_csr.sv` |
 | `tb/test_ctrl_fsm/`          | 12 | `rtl/ctrl_fsm.sv` (incl. K-tile + N-tile loops) |
-| `tb/test_top/`               | 19 | `rtl/tinyNPU_top.sv` 4×4 (incl. cycle counts for `docs/perf.md`) |
-| `tb/test_top_8x8/`           | 8  | `rtl/tinyNPU_top.sv` 8×8 (full feature coverage at ROWS=COLS=8) |
+| `tb/test_top/`               | 23 | `rtl/tinyNPU_top.sv` 4×4 (incl. cycle counts & M-sweep for `docs/perf.md`) |
+| `tb/test_top_8x8/`           | 12  | `rtl/tinyNPU_top.sv` 8×8 (full feature + M-sweep cycle counts) |
+| `tb/test_conv/`              | 8  | `rtl/tinyNPU_top.sv` 4×4 driven via Python im2col Conv2D |
 
 ## Toolchain & setup
 
@@ -224,8 +246,11 @@ tinyNPU/
 │   ├── ctrl_fsm.sv
 │   └── tinyNPU_top.sv
 ├── tb/
-│   ├── common/              cocotb.mk shared config, golden_model.py (numpy reference)
-│   └── test_*/              one cocotb testbench per RTL module + end-to-end test_top
+│   ├── common/              cocotb.mk shared config, golden_model.py (numpy
+│   │                        reference for GEMM/bias/ReLU/requantize), im2col.py
+│   │                        (software Conv2D driver, phase 13)
+│   └── test_*/              one cocotb testbench per RTL module + end-to-end
+│                            test_top (4×4) / test_top_8x8 (8×8) / test_conv
 └── scripts/
     ├── run_all.sh           batch regression
     └── lint.sh              Verilator strict lint
@@ -242,17 +267,12 @@ The strict rules live in `plan.md` §8. Highlights:
 - Instantiations use named connections only.
 - No `initial` / `#delay` / `$display` / `force` in synthesisable RTL.
 
-## Roadmap beyond v1
+## Roadmap
 
-Phases 13 through 14 are described in detail in `plan.md`. In short:
-
-| Phase | Headline goal | Effort |
-|-------|---------------|--------|
-| 13 | Conv2D via Python im2col driver | 1 d |
-| 14 | Coverage + cycle-count benchmarking + CI | 1–2 d |
-
-Performance numbers for the 4×4 vs 8×8 instances are in
-[`docs/perf.md`](./docs/perf.md).
+All 14 planned phases are complete. Performance numbers for the 4×4 vs
+8×8 instances are in [`docs/perf.md`](./docs/perf.md). Continuous
+integration runs on every push via
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
 ## License
 

@@ -330,7 +330,7 @@ tinyNPU/
 
 ---
 
-### 阶段 13 — Conv2D via im2col
+### 阶段 13 — Conv2D via im2col （已完成）
 **目标**：纯软件 + 现有 GEMM 引擎跑 Conv2D。
 
 - `tb/common/im2col.py`：把 `IFM[H,W,Cin]` 与 kernel `K[kh,kw,Cin,Cout]` 展开成 `A[H'W',kh*kw*Cin] @ B[kh*kw*Cin,Cout]`。
@@ -339,15 +339,27 @@ tinyNPU/
 
 预计：1 天（Python 工作）。
 
+实际实现：
+- `tb/common/im2col.py`：`im2col(ifm, kh, kw, stride, padding)` 按 (i, j) 行主序提 patch、按 (ki, kj, ci) 顺序 flatten 到 A 的列；`kernel_to_b(kernel)` 与之对齐 reshape 出 B；`output_shape` 给 valid-conv + zero padding 的 H'/W'；`conv2d_via_gemm` = im2col + INT32 matmul；`conv2d_reference` = 独立 nested-loop 直接卷积（不依赖 im2col、不依赖 scipy，与 numpy<1.22 / Py3.7 兼容），作为正确性参考。`conv2d_via_gemm` 与 `conv2d_reference` 在 6 组 sanity case (含 stride=2、padding=1、Cout=8) 上 bit-accurate 一致。
+- `tb/test_conv/`：复用 4×4 `top_harness.sv`（与 `tb/test_top/` 同形）+ 标准 cocotb.mk Makefile。`run_conv()` 驱动器把 conv 描述（H/W/Cin/Cout/kh/kw/stride/padding/bias/relu/req/per_channel）翻译成 GEMM 配置：`M = H'*W'`、`K = kh*kw*Cin`（必须为 ROWS=4 倍数）、`N = Cout`（必须为 COLS=4 倍数），随后走 IFM K-tile + W (n_tile, k_tile) + 可选 bias / per-channel mult/shift 的 backdoor 加载，APB 配置后 kick，读 OFM 与 `conv2d_reference` 接 bias_relu/requantize 后比对。
+- 测试：8 cases —— `test_conv_id` 烟测；`test_conv_4x4_k2x2`（M=9 K=16 N=4，单 K tile，raw 低字节输出）；`test_conv_4x4_k2x2_stride2`（stride=2，M=4）；`test_conv_5x5_k3x3`（K=36 强制 9 K tiles）；`test_conv_4x4_k3x3_pad1_relu_req`（padding=1，M=16，ReLU + global requantize）；`test_conv_5x5_k3x3_cout8_relu_req`（Cout=8 强制 2 N tiles）；`test_conv_5x5_k3x3_cout8_bias_relu_req`（含 per-N-tile bias）；`test_conv_5x5_k3x3_cout8_per_channel`（per-channel mult/shift，每 N tile 一组）。8/8 PASS。
+- RTL 一行未改；`scripts/run_all.sh` 全 18 个 testbench 仍全绿；`scripts/lint.sh` `--lint-only -Wall` 仍 0 警告。
+
 ---
 
-### 阶段 14 — 性能与覆盖率
-- 跑 cocotb coverage（line / toggle）和 verilator `--coverage` 收集覆盖率。
-- 端到端 GEMM 周期数 vs 理论下限的对比，找 hotspot。
-- 可选：把 SRAM 三块的容量、带宽参数化，跑 sweep。
-- 可选：结合 GitHub Actions 把 `run_all.sh` + `lint.sh` 接入 CI。
+### 阶段 14 — 性能与覆盖率 （已完成）
+**目标**：端到端 cycle-count 基准、hotspot 分析、CI 接入。
 
-预计：1–2 天。
+实际实现：
+- **Cycle-count sweep**：`test_top.py` 新增 4 个 sweep 测试（4×4 单 tile M=8/16 + 4×4 N=K=8 M=8/16），`test_top_8x8.py` 新增 4 个（8×8 单 tile M=8/16 + 8×8 N=K=16 M=8/16），共 8 个 `PERF` 测量点，每个都打印 cycles / MACs / MAC-per-cycle / PE utilisation。
+- **理论下限公式**：`cycles ≈ M + (ROWS + COLS) + 8`（单 tile），实测完全吻合。多 tile 下 per-tile overhead 少 2 周期（WRITEBACK 仅在 last K tile 触发）。
+- **Hotspot 分析**：唯一 hotspot 是 fill/drain pipeline tax（`ROWS + COLS` 周期），所有其他阶段（LOAD_W / LOAD_BIAS / LOAD_REQ / WRITEBACK）仅数周期。有效利用率完全由 M 主导：4×4 M=16 单 tile 达 50 %，M=64（参数范围内）可达 73 %。
+- **perf.md 重写**：`docs/perf.md` 从 2 个测量点扩展为完整 benchmark 报告，含理论推导、4×4 与 8×8 单 tile / 多 tile sweep 表、apples-to-apples 跨阵列对比、hotspot 分析、forward-path 说明。
+- **GitHub Actions CI**：新增 `.github/workflows/ci.yml`——Ubuntu runner + Python 3.7 + cocotb 1.8.1 + numpy<1.22 + Icarus 12 + Verilator，push/PR 触发 `scripts/run_all.sh` + `scripts/lint.sh`。
+- **lint.sh 跨平台**：`VERILATOR_BIN` 默认从硬编码 Windows 路径改为 `verilator`（Linux/CI），Windows 用户通过环境变量覆盖即可；同样 `VERILATOR_ROOT` 默认改为 `/usr/share/verilator`。
+- **Verilator `--coverage`**：不接入（需将仿真器从 Icarus 切 Verilator，Makefile 改动大，v1 价值不抵风险）。perf.md 的 "Future work — coverage" 段落给出 follow-up 步骤。
+- **SRAM 容量参数 sweep**：不接入（plan §14 标 "可选"，会改 RTL 表面，v1 无此需求）。
+- `scripts/run_all.sh` 全 18 个 testbench 仍全绿；`scripts/lint.sh` 仍 0 警告；RTL 一行未改。
 
 ---
 

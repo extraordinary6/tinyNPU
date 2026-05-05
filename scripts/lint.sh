@@ -8,12 +8,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERILATOR_BIN="${VERILATOR_BIN:-/d/MinGW/mingw/mingw64/bin/verilator_bin.exe}"
-export VERILATOR_ROOT="${VERILATOR_ROOT:-/d/MinGW/mingw/mingw64/share/verilator}"
+VERILATOR_BIN="${VERILATOR_BIN:-verilator}"
+export VERILATOR_ROOT="${VERILATOR_ROOT:-/usr/share/verilator}"
 
-if [[ ! -x "$VERILATOR_BIN" ]]; then
-    echo "verilator_bin.exe not found at $VERILATOR_BIN"
-    echo "install: pacman -S mingw-w64-x86_64-verilator"
+if ! command -v "$VERILATOR_BIN" >/dev/null 2>&1; then
+    echo "verilator not found on PATH"
+    echo "install: apt-get install verilator (Linux) or pacman -S mingw-w64-x86_64-verilator (MSYS2)"
     echo "or override VERILATOR_BIN / VERILATOR_ROOT envvars"
     exit 1
 fi

@@ -943,3 +943,88 @@ async def test_top_4x4_cycle_count_n8k8(dut):
             break
     assert seen_busy
     cocotb.log.info(f"4x4 GEMM (M={M}, N={N}, K={K}) cycles to busy=0: {cycles}")
+
+
+# ---------------- phase 14 cycle-count sweeps ----------------
+# Sweep M for the single-tile 4x4 problem, then M for the 2x2-tile
+# (N=8, K=8) problem. Goal: show fill/drain pipeline tax amortising
+# as M grows. Captured numbers feed docs/perf.md.
+
+async def _measure_cycles(dut, max_cycles=2000):
+    """Kick CTRL[0]=1 and count cycles until busy returns to 0."""
+    await apb_write(dut, A_CTRL, 0x1)
+    cycles = 0
+    seen_busy = False
+    for _ in range(max_cycles):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        cycles += 1
+        if int(dut.u_dut.busy.value):
+            seen_busy = True
+        elif seen_busy:
+            return cycles
+    raise TimeoutError("engine never returned to IDLE")
+
+
+async def _run_4x4_singletile(dut, M):
+    """Single (n_tile=1, k_tile=1) measurement at the requested M on 4x4."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+    N = COLS
+    K = ROWS
+    A = np.ones((M, K), dtype=np.int8)
+    W = np.ones((K, N), dtype=np.int8)
+    await load_ifm(dut, A, base=0)
+    await load_w(dut, W, addr=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x80,
+                    flags=0, req_mult=1, req_shift=0)
+    cycles = await _measure_cycles(dut)
+    macs = M * N * K
+    cocotb.log.info(
+        f"PERF 4x4 single-tile M={M} N={N} K={K}: "
+        f"cycles={cycles} macs={macs} mac_per_cycle={macs/cycles:.3f} "
+        f"util={100*macs/(cycles*ROWS*COLS):.1f}%"
+    )
+
+
+async def _run_4x4_n8k8(dut, M):
+    """N=8, K=8 (2x2 tiles) at the requested M on 4x4."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+    N = 8
+    K = 8
+    A = np.ones((M, K), dtype=np.int8)
+    W = np.ones((K, N), dtype=np.int8)
+    await load_ifm_ktile(dut, A, ifm_base=0, M=M)
+    await load_w_full(dut, W, w_base=0)
+    await configure(dut, M=M, N=N, K=K,
+                    ifm_base=0, w_base=0, ofm_base=0x80,
+                    flags=0, req_mult=1, req_shift=0)
+    cycles = await _measure_cycles(dut)
+    macs = M * N * K
+    cocotb.log.info(
+        f"PERF 4x4 ntile=2 ktile=2 M={M} N={N} K={K}: "
+        f"cycles={cycles} macs={macs} mac_per_cycle={macs/cycles:.3f} "
+        f"util={100*macs/(cycles*ROWS*COLS):.1f}%"
+    )
+
+
+@cocotb.test()
+async def test_top_4x4_perf_singletile_m8(dut):
+    await _run_4x4_singletile(dut, M=8)
+
+
+@cocotb.test()
+async def test_top_4x4_perf_singletile_m16(dut):
+    await _run_4x4_singletile(dut, M=16)
+
+
+@cocotb.test()
+async def test_top_4x4_perf_n8k8_m8(dut):
+    await _run_4x4_n8k8(dut, M=8)
+
+
+@cocotb.test()
+async def test_top_4x4_perf_n8k8_m16(dut):
+    await _run_4x4_n8k8(dut, M=16)
