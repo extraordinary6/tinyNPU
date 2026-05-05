@@ -5,11 +5,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# On MSYS2/MinGW, the verilator wrapper script needs Perl's Pod::Usage which
-# may not be installed. Use verilator_bin directly to bypass the wrapper.
+# The verilator wrapper script can misbehave on both Ubuntu (wrong binary path)
+# and MSYS2 (missing Perl Pod::Usage). Use verilator_bin directly everywhere.
 UNAME_S="$(uname -s)"
 if [[ "$UNAME_S" == Linux ]]; then
-    VERILATOR_BIN="${VERILATOR_BIN:-verilator}"
+    VERILATOR_BIN="${VERILATOR_BIN:-verilator_bin}"
 else
     VERILATOR_BIN="${VERILATOR_BIN:-verilator_bin.exe}"
 fi
