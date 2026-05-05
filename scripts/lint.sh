@@ -5,7 +5,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERILATOR_BIN="${VERILATOR_BIN:-verilator}"
+# On MSYS2/MinGW, the verilator wrapper script needs Perl's Pod::Usage which
+# may not be installed. Use verilator_bin directly to bypass the wrapper.
+UNAME_S="$(uname -s)"
+if [[ "$UNAME_S" == Linux ]]; then
+    VERILATOR_BIN="${VERILATOR_BIN:-verilator}"
+else
+    VERILATOR_BIN="${VERILATOR_BIN:-verilator_bin.exe}"
+fi
 
 if ! command -v "$VERILATOR_BIN" >/dev/null 2>&1; then
     echo "verilator not found on PATH"
@@ -24,31 +31,18 @@ if (( ${#sv_files[@]} == 0 )); then
     exit 0
 fi
 
-# On Ubuntu, verilator package installs:
-#   /usr/bin/verilator      (wrapper script)
-#   /usr/bin/verilator_bin  (actual binary)
-#   /usr/share/verilator/   (includes, examples)
-# The wrapper script expects VERILATOR_ROOT=/usr/share/verilator
-# but the binary path is hardcoded correctly.
-# On MSYS2, verilator_bin.exe is in the same dir as the wrapper.
+# VERILATOR_ROOT: needed so verilator can find its share/ includes.
+# Derive from binary location if not set: <prefix>/bin/verilator -> <prefix>/share/verilator
 if [ -z "${VERILATOR_ROOT:-}" ]; then
-    # Set VERILATOR_ROOT only if share dir exists and wrapper needs it
-    if [ -d "/usr/share/verilator" ]; then
+    bin_path="$(command -v "$VERILATOR_BIN")"
+    bin_dir="$(dirname "$bin_path")"
+    prefix="${bin_dir%/bin}"
+    if [ -d "$prefix/share/verilator" ]; then
+        export VERILATOR_ROOT="$prefix/share/verilator"
+    elif [ -d "/usr/share/verilator" ]; then
         export VERILATOR_ROOT="/usr/share/verilator"
     fi
 fi
 
-# Try running verilator directly; if it fails due to VERILATOR_ROOT,
-# try with verilator_bin directly (Ubuntu package layout)
-if ! "$VERILATOR_BIN" --lint-only -Wall --top-module tinyNPU_top "${sv_files[@]}" 2>/dev/null; then
-    # Fallback: run verilator_bin directly if available (Ubuntu package)
-    if command -v verilator_bin >/dev/null 2>&1; then
-        echo "Falling back to verilator_bin directly..."
-        verilator_bin --lint-only -Wall --top-module tinyNPU_top "${sv_files[@]}"
-    else
-        # Re-run to show the actual error
-        "$VERILATOR_BIN" --lint-only -Wall --top-module tinyNPU_top "${sv_files[@]}"
-    fi
-fi
-
+"$VERILATOR_BIN" --lint-only -Wall --top-module tinyNPU_top "${sv_files[@]}"
 echo ">>> lint passed"
