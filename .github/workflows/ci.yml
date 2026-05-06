@@ -30,3 +30,72 @@ jobs:
 
       - name: Verilator strict lint
         run: bash scripts/lint.sh
+
+  coverage:
+    # Verilator-based line/toggle coverage. Runs in parallel with regression
+    # and is allowed to fail without blocking the merge — the goal here is
+    # to produce a coverage report artifact, not to gate on a threshold.
+    # cocotb 1.8.1's Verilator backend needs verilator >= 4.106; ubuntu-22.04
+    # apt only has 4.038 and ubuntu-24.04 has no Python 3.7 available via
+    # actions/setup-python, so build verilator from source on 22.04 and
+    # cache the install prefix.
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    env:
+      VERILATOR_VERSION: v5.024
+      VERILATOR_PREFIX: /opt/verilator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache verilator build
+        id: verilator-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VERILATOR_PREFIX }}
+          key: verilator-${{ env.VERILATOR_VERSION }}-ubuntu-22.04
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lcov
+          if [ ! -x "${VERILATOR_PREFIX}/bin/verilator" ]; then
+            sudo apt-get install -y -qq git make autoconf g++ flex bison libfl-dev help2man
+          fi
+
+      - name: Build verilator from source
+        if: steps.verilator-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "${VERILATOR_VERSION}" https://github.com/verilator/verilator /tmp/verilator
+          cd /tmp/verilator
+          autoconf
+          ./configure --prefix="${VERILATOR_PREFIX}"
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Expose verilator on PATH
+        run: echo "${VERILATOR_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Python 3.7
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.7"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect coverage from every testbench
+        run: bash scripts/run_coverage.sh
+
+      - name: Generate HTML report
+        run: |
+          if [ -f coverage_out/merged.info ]; then
+            genhtml coverage_out/merged.info -o coverage_out/html
+          fi
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage_out/
+          if-no-files-found: warn

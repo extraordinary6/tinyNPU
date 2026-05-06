@@ -145,18 +145,38 @@ followed by `scripts/lint.sh` (Verilator strict lint) on an Ubuntu
 runner with Python 3.7 + cocotb 1.8.1 + numpy<1.22 + Icarus 12 +
 Verilator. Failures gate the merge.
 
-## Future work — coverage
+## Coverage
 
 Cocotb 1.8.1 surfaces line/toggle counters when running under
-`SIM=verilator` rather than Icarus. Switching the regression simulator
-is a Makefile-level change but breaks Icarus's MSYS2 workarounds. A
-small follow-up could:
+`SIM=verilator` rather than Icarus. The regression simulator stays on
+Icarus (faster, no MSYS2 quirks); coverage runs are an opt-in
+secondary path:
 
-1. Add a `SIM ?= icarus` Makefile knob that forwards to cocotb's own
-   `SIM` selection.
-2. Add a `make coverage` target in the testbenches that re-runs under
-   Verilator with `-CFLAGS --coverage`.
-3. Aggregate `coverage.info` artifacts in CI.
+1. `tb/common/cocotb.mk` exposes `SIM ?= icarus`. Override to
+   `SIM=verilator` for a one-off Verilator run.
+2. `make coverage` (also defined in `tb/common/cocotb.mk`) re-invokes
+   the testbench under Verilator with `--coverage-line
+   --coverage-toggle`, then runs `verilator_coverage --write-info` to
+   produce `coverage.info` (lcov format) next to the testbench's
+   Makefile.
+3. `scripts/run_coverage.sh` walks every `tb/test_*/`, runs
+   `make coverage`, and merges per-tb `coverage.info` files into
+   `coverage_out/merged.info` with `lcov -a`. Testbenches that fail
+   under Verilator (which is stricter than Icarus) are logged and
+   skipped — the rest still produce useful coverage.
 
-Out of scope for v1; the cycle-count sweeps above already cover the
-end-to-end performance question that phase 14 set out to answer.
+CI runs the script in a separate `coverage` job (see
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) on
+`ubuntu-22.04` with verilator built from source (cocotb 1.8.1 needs
+verilator ≥ 4.106; the apt package on 22.04 is 4.038, and ubuntu-24.04
+has no Python 3.7 available via `actions/setup-python`). The verilator
+prefix is cached so subsequent runs skip the ~5 min compile. The job
+is `continue-on-error: true` and uploads `coverage_out/` (merged info
++ HTML) as an artifact — there is no threshold gate; the goal is to
+expose what is and isn't exercised, not to block merges.
+
+Local coverage runs are blocked on MSYS2 because the system Perl is
+missing `Pod::Usage` (the verilator wrapper script needs it) and MSYS
+make filters most environment variables, breaking `SIM=verilator`
+propagation across cocotb's recursive `$(MAKE)`. Use the CI artifact
+or WSL2 to view the report locally.
