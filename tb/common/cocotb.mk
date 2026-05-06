@@ -41,7 +41,15 @@ SIM_CMD_PREFIX := PYTHONHOME=$(PYTHONHOME_WINPATH)
 endif
 
 TOPLEVEL_LANG ?= verilog
-SIM           ?= icarus
+
+# When `make coverage` is the goal, force SIM=verilator at the outer
+# make's parse time. Cocotb's Makefile.icarus does a parse-time
+# `$(error)` if iverilog isn't installed, so the outer make would die
+# before the coverage recipe ever runs on a Verilator-only CI runner.
+ifneq (,$(filter coverage,$(MAKECMDGOALS)))
+    SIM := verilator
+endif
+SIM ?= icarus
 
 # Pin the default goal to cocotb's `sim` target. Without this, the `coverage`
 # rule below (the first explicit rule encountered when this fragment is
