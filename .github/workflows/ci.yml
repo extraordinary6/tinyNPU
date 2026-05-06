@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Opt actions into Node.js 24 ahead of the 2026-06-02 default switch.
+# actions/{checkout,cache,setup-python,upload-artifact} still ship Node 20
+# binaries at their current major versions; this flag forces them to run on
+# the runner's Node 24 toolchain and silences the deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   regression:
     runs-on: ubuntu-22.04
