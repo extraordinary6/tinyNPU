@@ -128,6 +128,19 @@ module tinyNPU_top #(
     localparam int LOG2_COLS = $clog2(COLS);
     assign k_tiles_total = k_count_w[LOG2_COLS +: K_TILE_W];
     assign n_tiles_total = n_count_w[LOG2_COLS +: N_TILE_W];
+    logic k_aligned;
+    logic n_aligned;
+    logic m_fits;
+    logic k_tiles_fit;
+    logic n_tiles_fit;
+    logic params_extra_ok;
+    assign k_aligned     = (LOG2_COLS == 0) ? 1'b1 : (k_count_w[LOG2_COLS-1:0] == {LOG2_COLS{1'b0}});
+    assign n_aligned     = (LOG2_COLS == 0) ? 1'b1 : (n_count_w[LOG2_COLS-1:0] == {LOG2_COLS{1'b0}});
+    assign m_fits        = (m_count_w[31:M_W] == {(32-M_W){1'b0}})
+                           && (m_count_w[M_W-1:0] <= M_W'(M_MAX));
+    assign k_tiles_fit   = (k_count_w[31:LOG2_COLS+K_TILE_W] == {(32-LOG2_COLS-K_TILE_W){1'b0}});
+    assign n_tiles_fit   = (n_count_w[31:LOG2_COLS+N_TILE_W] == {(32-LOG2_COLS-N_TILE_W){1'b0}});
+    assign params_extra_ok = k_aligned && n_aligned && m_fits && k_tiles_fit && n_tiles_fit;
 
     ctrl_fsm #(
         .K_TILE_W (K_TILE_W),
@@ -141,6 +154,7 @@ module tinyNPU_top #(
         .k_count       (k_count_w),
         .k_tiles_total (k_tiles_total),
         .n_tiles_total (n_tiles_total),
+        .params_extra_ok(params_extra_ok),
         .bias_en       (flags_w[0]),
         .pch_req_en    (flags_w[3]),
         .wl_start      (wl_start),

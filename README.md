@@ -17,7 +17,7 @@ M, arbitrary K (multiple of `COLS`) accumulated across multiple weight tiles,
 and arbitrary N (multiple of `COLS`) swept across multiple column blocks;
 optional bias, ReLU, and TFLite-lite requantize (global or per-channel) all
 driven through the APB3 CSR interface. The PE array is parameterized — the
-4×4 reference and an 8×8 instance are both verified end-to-end. Conv2D is
+4×4 reference, 8×8 instance, and a 16×16 stress configuration are verified end-to-end. Conv2D is
 supported via a software im2col driver on top of the unmodified GEMM engine.
 
 | Phase | Content | State |
@@ -111,7 +111,7 @@ of each N tile, so overall kick latency scales with
 
 ## Test summary
 
-18 cocotb testbenches, 125 cases total. Run them all with `bash scripts/run_all.sh`.
+19 cocotb testbenches, 130 cases total. Run them all with `bash scripts/run_all.sh`.
 
 | Testbench | Cases | DUT |
 |-----------|-------|-----|
@@ -132,6 +132,7 @@ of each N tile, so overall kick latency scales with
 | `tb/test_ctrl_fsm/`          | 12 | `rtl/ctrl_fsm.sv` (incl. K-tile + N-tile loops) |
 | `tb/test_top/`               | 23 | `rtl/tinyNPU_top.sv` 4×4 (incl. cycle counts & M-sweep for `docs/perf.md`) |
 | `tb/test_top_8x8/`           | 12  | `rtl/tinyNPU_top.sv` 8×8 (full feature + M-sweep cycle counts) |
+| `tb/test_top_16x16/`         | 5  | `rtl/tinyNPU_top.sv` 16×16 (scalability stress + full path checks) |
 | `tb/test_conv/`              | 8  | `rtl/tinyNPU_top.sv` 4×4 driven via Python im2col Conv2D |
 
 ## Toolchain & setup
@@ -250,7 +251,8 @@ tinyNPU/
 │   │                        reference for GEMM/bias/ReLU/requantize), im2col.py
 │   │                        (software Conv2D driver, phase 13)
 │   └── test_*/              one cocotb testbench per RTL module + end-to-end
-│                            test_top (4×4) / test_top_8x8 (8×8) / test_conv
+│                            test_top (4×4) / test_top_8x8 (8×8) /
+│                            test_top_16x16 (16×16) / test_conv
 └── scripts/
     ├── run_all.sh           batch regression
     └── lint.sh              Verilator strict lint
@@ -274,7 +276,21 @@ All 14 planned phases are complete. Performance numbers for the 4×4 vs
 integration runs on every push via
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
+## Capability boundaries
+
+- Supported: GEMM with `K`/`N` as positive multiples of `COLS`, optional bias/ReLU/requantize, per-channel requantize, software-side Conv2D via im2col.
+- Rejected at launch (`STATUS.ERR` pulse): zero dimensions, `K`/`N` not aligned to `COLS`, `M > M_MAX`, or `K`/`N` tile counts exceeding the configured tile counter width.
+- Caller-managed SRAM layout is required; the engine does not perform bounds checks on SRAM addresses.
+
+## Minimal host flow example
+
+See [`examples/minimal_host_driver.py`](./examples/minimal_host_driver.py) for a minimal host-side flow covering:
+
+1. IFM/W (and optional bias/req params) SRAM packing and writes,
+2. CSR programming and kick (`CTRL[0]`),
+3. polling `STATUS`,
+4. OFM readback reconstruction.
+
 ## License
 
 Released under the MIT License. See [`LICENSE`](./LICENSE) for the full text.
-

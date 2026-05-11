@@ -57,6 +57,33 @@ done
 if command -v lcov >/dev/null 2>&1; then
     lcov "${add_args[@]}" -o "$OUT/merged.info"
     echo ">>> wrote $OUT/merged.info"
+
+    # Optional quality gate: enforce line coverage over selected core RTL files.
+    # Enable with COVERAGE_CORE_MIN_LINE (e.g. 60). Uses merged.info as input.
+    if [[ -n "${COVERAGE_CORE_MIN_LINE:-}" ]]; then
+        CORE_INFO="$OUT/core.info"
+        core_patterns=(
+            "$ROOT/rtl/ctrl_fsm.sv"
+            "$ROOT/rtl/tinyNPU_top.sv"
+            "$ROOT/rtl/systolic_array.sv"
+            "$ROOT/rtl/pe.sv"
+        )
+        lcov --extract "$OUT/merged.info" "${core_patterns[@]}" -o "$CORE_INFO" >/dev/null 2>&1 || true
+        if [[ ! -f "$CORE_INFO" ]]; then
+            echo ">>> coverage gate failed: no extracted core coverage data"
+            exit 1
+        fi
+        core_line_pct="$(lcov --summary "$CORE_INFO" | awk '/lines\\.*:/ {gsub("%","",$2); print $2; exit}')"
+        if [[ -z "$core_line_pct" ]]; then
+            echo ">>> coverage gate failed: could not parse core line coverage"
+            exit 1
+        fi
+        echo ">>> core line coverage: ${core_line_pct}% (min ${COVERAGE_CORE_MIN_LINE}%)"
+        if ! awk -v got="$core_line_pct" -v min="$COVERAGE_CORE_MIN_LINE" 'BEGIN { exit !(got + 0 >= min + 0) }'; then
+            echo ">>> coverage gate failed: core line coverage below threshold"
+            exit 1
+        fi
+    fi
 else
     echo ">>> lcov not installed; per-tb info files left in $OUT"
 fi

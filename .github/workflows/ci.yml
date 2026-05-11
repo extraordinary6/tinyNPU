@@ -40,17 +40,17 @@ jobs:
 
   coverage:
     # Verilator-based line/toggle coverage. Runs in parallel with regression
-    # and is allowed to fail without blocking the merge — the goal here is
-    # to produce a coverage report artifact, not to gate on a threshold.
+    # and enforces a core-module line coverage threshold while still uploading
+    # the report artifact for inspection.
     # cocotb 1.8.1's Verilator backend needs verilator >= 4.106; ubuntu-22.04
     # apt only has 4.038 and ubuntu-24.04 has no Python 3.7 available via
     # actions/setup-python, so build verilator from source on 22.04 and
     # cache the install prefix.
     runs-on: ubuntu-22.04
-    continue-on-error: true
     env:
       VERILATOR_VERSION: v5.024
       VERILATOR_PREFIX: /opt/verilator
+      COVERAGE_CORE_MIN_LINE: "55"
     steps:
       - uses: actions/checkout@v4
 

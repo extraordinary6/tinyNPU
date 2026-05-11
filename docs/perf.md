@@ -3,7 +3,9 @@
 Cycle counts measured at the APB level: from the cycle when `CTRL[0]=1`
 is written until `STATUS.BUSY` returns to 0. All measurements use the
 all-ones synthetic workload (`A = 1`, `W = 1`), no bias / ReLU / requantize.
-"PE utilisation" is `MACs / (cycles × ROWS × COLS)`.
+"PE utilisation" is `MACs / (cycles × ROWS × COLS)`. Regressions also print
+per-state occupancy (`BOTTLENECK` lines) for `LOAD_W / LOAD_BIAS / LOAD_REQ /
+COMPUTE / WRITEBACK` to quantify control-side bottlenecks.
 
 The captured measurements live in two cocotb sweeps and are part of the
 regression — `bash scripts/run_all.sh` re-prints every `PERF` line:
@@ -171,9 +173,9 @@ CI runs the script in a separate `coverage` job (see
 verilator ≥ 4.106; the apt package on 22.04 is 4.038, and ubuntu-24.04
 has no Python 3.7 available via `actions/setup-python`). The verilator
 prefix is cached so subsequent runs skip the ~5 min compile. The job
-is `continue-on-error: true` and uploads `coverage_out/` (merged info
-+ HTML) as an artifact — there is no threshold gate; the goal is to
-expose what is and isn't exercised, not to block merges.
+uploads `coverage_out/` (merged info + HTML) as an artifact and enforces
+a core-module line-coverage threshold (`COVERAGE_CORE_MIN_LINE`) over
+`ctrl_fsm.sv`, `tinyNPU_top.sv`, `systolic_array.sv`, and `pe.sv`.
 
 Local coverage runs are blocked on MSYS2 because the system Perl is
 missing `Pod::Usage` (the verilator wrapper script needs it) and MSYS

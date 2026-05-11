@@ -33,6 +33,11 @@ CLK_NS = 10
 SETTLE_NS = 1
 ROWS = 4
 COLS = 4
+FSM_S_LOAD_W = 1
+FSM_S_LOAD_BIAS = 2
+FSM_S_LOAD_REQ = 3
+FSM_S_COMPUTE = 4
+FSM_S_WRITEBACK = 5
 
 A_ID = 0x000
 A_CTRL = 0x004
@@ -330,6 +335,44 @@ async def test_top_err_on_zero_dim(dut):
         if int(dut.u_dut.err.value):
             saw_err += 1
     assert saw_err >= 1, "ERR was never asserted"
+    assert int(dut.u_dut.busy.value) == 0
+
+
+@cocotb.test()
+async def test_top_err_on_misaligned_dims(dut):
+    """K/N not aligned to COLS should be rejected at launch."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+    await configure(dut, M=4, N=6, K=5,
+                    ifm_base=0, w_base=0, ofm_base=0,
+                    flags=0, req_mult=1, req_shift=0)
+    await kick(dut)
+    saw_err = 0
+    for _ in range(8):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        if int(dut.u_dut.err.value):
+            saw_err += 1
+    assert saw_err >= 1, "ERR was never asserted for misaligned K/N"
+    assert int(dut.u_dut.busy.value) == 0
+
+
+@cocotb.test()
+async def test_top_err_on_m_overflow(dut):
+    """M > M_MAX should be rejected by top-level parameter guards."""
+    cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
+    await reset(dut)
+    await configure(dut, M=65, N=COLS, K=ROWS,
+                    ifm_base=0, w_base=0, ofm_base=0,
+                    flags=0, req_mult=1, req_shift=0)
+    await kick(dut)
+    saw_err = 0
+    for _ in range(8):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        if int(dut.u_dut.err.value):
+            saw_err += 1
+    assert saw_err >= 1, "ERR was never asserted for M overflow"
     assert int(dut.u_dut.busy.value) == 0
 
 
@@ -966,6 +1009,38 @@ async def _measure_cycles(dut, max_cycles=2000):
     raise TimeoutError("engine never returned to IDLE")
 
 
+async def _measure_cycles_with_state_stats(dut, max_cycles=2000):
+    await apb_write(dut, A_CTRL, 0x1)
+    cycles = 0
+    seen_busy = False
+    state_counts = {
+        FSM_S_LOAD_W: 0,
+        FSM_S_LOAD_BIAS: 0,
+        FSM_S_LOAD_REQ: 0,
+        FSM_S_COMPUTE: 0,
+        FSM_S_WRITEBACK: 0,
+    }
+    for _ in range(max_cycles):
+        await RisingEdge(dut.pclk)
+        await Timer(SETTLE_NS, units="ns")
+        cycles += 1
+        busy = int(dut.u_dut.busy.value)
+        if busy:
+            seen_busy = True
+            state = int(dut.u_dut.u_fsm.state.value)
+            if state in state_counts:
+                state_counts[state] += 1
+        elif seen_busy:
+            return cycles, state_counts
+    raise TimeoutError("engine never returned to IDLE")
+
+
+def _state_pct(state_counts, cycles, state):
+    if cycles == 0:
+        return 0.0
+    return 100.0 * state_counts[state] / cycles
+
+
 async def _run_4x4_singletile(dut, M):
     """Single (n_tile=1, k_tile=1) measurement at the requested M on 4x4."""
     cocotb.start_soon(Clock(dut.pclk, CLK_NS, units="ns").start())
@@ -979,12 +1054,20 @@ async def _run_4x4_singletile(dut, M):
     await configure(dut, M=M, N=N, K=K,
                     ifm_base=0, w_base=0, ofm_base=0x80,
                     flags=0, req_mult=1, req_shift=0)
-    cycles = await _measure_cycles(dut)
+    cycles, state_counts = await _measure_cycles_with_state_stats(dut)
     macs = M * N * K
     cocotb.log.info(
         f"PERF 4x4 single-tile M={M} N={N} K={K}: "
         f"cycles={cycles} macs={macs} mac_per_cycle={macs/cycles:.3f} "
         f"util={100*macs/(cycles*ROWS*COLS):.1f}%"
+    )
+    cocotb.log.info(
+        f"BOTTLENECK 4x4 single-tile M={M}: "
+        f"load_w={_state_pct(state_counts, cycles, FSM_S_LOAD_W):.1f}% "
+        f"load_bias={_state_pct(state_counts, cycles, FSM_S_LOAD_BIAS):.1f}% "
+        f"load_req={_state_pct(state_counts, cycles, FSM_S_LOAD_REQ):.1f}% "
+        f"compute={_state_pct(state_counts, cycles, FSM_S_COMPUTE):.1f}% "
+        f"writeback={_state_pct(state_counts, cycles, FSM_S_WRITEBACK):.1f}%"
     )
 
 
@@ -1001,12 +1084,20 @@ async def _run_4x4_n8k8(dut, M):
     await configure(dut, M=M, N=N, K=K,
                     ifm_base=0, w_base=0, ofm_base=0x80,
                     flags=0, req_mult=1, req_shift=0)
-    cycles = await _measure_cycles(dut)
+    cycles, state_counts = await _measure_cycles_with_state_stats(dut)
     macs = M * N * K
     cocotb.log.info(
         f"PERF 4x4 ntile=2 ktile=2 M={M} N={N} K={K}: "
         f"cycles={cycles} macs={macs} mac_per_cycle={macs/cycles:.3f} "
         f"util={100*macs/(cycles*ROWS*COLS):.1f}%"
+    )
+    cocotb.log.info(
+        f"BOTTLENECK 4x4 ntile=2 ktile=2 M={M}: "
+        f"load_w={_state_pct(state_counts, cycles, FSM_S_LOAD_W):.1f}% "
+        f"load_bias={_state_pct(state_counts, cycles, FSM_S_LOAD_BIAS):.1f}% "
+        f"load_req={_state_pct(state_counts, cycles, FSM_S_LOAD_REQ):.1f}% "
+        f"compute={_state_pct(state_counts, cycles, FSM_S_COMPUTE):.1f}% "
+        f"writeback={_state_pct(state_counts, cycles, FSM_S_WRITEBACK):.1f}%"
     )
 
 

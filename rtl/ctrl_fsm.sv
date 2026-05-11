@@ -40,6 +40,7 @@ module ctrl_fsm #(
     input  logic [31:0]             k_count,
     input  logic [K_TILE_W-1:0]     k_tiles_total,
     input  logic [N_TILE_W-1:0]     n_tiles_total,
+    input  logic                    params_extra_ok,
     input  logic                    bias_en,
     input  logic                    pch_req_en,
 
@@ -85,7 +86,8 @@ module ctrl_fsm #(
     assign params_ok = (m_count != 32'h0) && (n_count != 32'h0)
                        && (k_count != 32'h0)
                        && (k_tiles_total != {K_TILE_W{1'b0}})
-                       && (n_tiles_total != {N_TILE_W{1'b0}});
+                       && (n_tiles_total != {N_TILE_W{1'b0}})
+                       && params_extra_ok;
 
     assign tile_idx     = tile_idx_q;
     assign first_tile   = (tile_idx_q == {K_TILE_W{1'b0}});

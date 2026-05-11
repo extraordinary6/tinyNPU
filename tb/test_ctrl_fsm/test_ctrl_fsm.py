@@ -29,6 +29,7 @@ async def reset(dut, cycles=2):
     dut.k_count.value = 0
     dut.k_tiles_total.value = 0
     dut.n_tiles_total.value = 0
+    dut.params_extra_ok.value = 1
     dut.bias_en.value = 0
     dut.pch_req_en.value = 0
     dut.wl_done.value = 0
@@ -43,12 +44,13 @@ async def reset(dut, cycles=2):
     await Timer(SETTLE_NS, units="ns")
 
 
-async def pulse_start(dut, *, m=4, n=4, k=4, k_tiles=1, n_tiles=1, bias=0, pch=0):
+async def pulse_start(dut, *, m=4, n=4, k=4, k_tiles=1, n_tiles=1, params_extra_ok=1, bias=0, pch=0):
     dut.m_count.value = m
     dut.n_count.value = n
     dut.k_count.value = k
     dut.k_tiles_total.value = k_tiles
     dut.n_tiles_total.value = n_tiles
+    dut.params_extra_ok.value = params_extra_ok
     dut.bias_en.value = bias
     dut.pch_req_en.value = pch
     dut.start.value = 1
@@ -446,6 +448,19 @@ async def test_fsm_err_on_zero_dim(dut):
         await Timer(SETTLE_NS, units="ns")
         assert int(dut.err.value) == 0
         assert int(dut.busy.value) == 0
+
+
+@cocotb.test()
+async def test_fsm_err_on_extra_param_guard(dut):
+    """params_extra_ok=0 should force IDLE->ERR and block any launch pulse."""
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    await reset(dut)
+    await pulse_start(dut, m=4, n=4, k=4, k_tiles=1, n_tiles=1, params_extra_ok=0)
+    assert int(dut.err.value) == 1
+    assert int(dut.wl_start.value) == 0
+    await RisingEdge(dut.clk)
+    await Timer(SETTLE_NS, units="ns")
+    assert int(dut.busy.value) == 0
 
 
 @cocotb.test()
