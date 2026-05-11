@@ -87,7 +87,7 @@ the existing GEMM engine. `tb/common/im2col.py` exposes:
 - `output_shape(H, W, kh, kw, stride, padding)` → `(H', W')`.
 - `conv2d_via_gemm(ifm, kernel, …)` → INT32 `[H', W', Cout]` via im2col + matmul.
 - `conv2d_reference(ifm, kernel, …)` → independent nested-loop reference (no
-  scipy dependency, kept Py3.7 / `numpy<1.22` compatible) used as the
+  scipy dependency, kept Py3.10 / `numpy<1.22` compatible) used as the
   cross-check golden.
 
 `tb/test_conv/` reuses the standard 4×4 `top_harness.sv` and pushes the
@@ -136,7 +136,7 @@ of each N tile, so overall kick latency scales with
 
 ## Toolchain & setup
 
-The project has been developed and verified on **Windows + MSYS2 + Anaconda Python 3.7
+The project has been developed and verified on **Windows + MSYS2 + Anaconda Python 3.10
 + Icarus Verilog**. Linux should also work with minor adjustments, but is not
 tested here.
 
@@ -146,8 +146,8 @@ tested here.
 |------|----------------|----------------|
 | MSYS2 (`bash` + `make`) | 2024+ | https://www.msys2.org/, then `pacman -S make` |
 | Icarus Verilog | 12.0+ (devel) | https://bleyer.org/icarus/ (Windows builds) |
-| Python | 3.7.x | conda recommended: `conda create -n py37 python=3.7` |
-| `cocotb` | **1.8.1** (last version supporting Py3.7) | `pip install cocotb==1.8.1` |
+| Python | 3.10.x | conda recommended: `conda create -n py310 python=3.10` |
+| `cocotb` | **1.9.2** | `pip install cocotb==1.9.2` |
 | `numpy` | <1.22 | pinned in `requirements.txt` |
 | `pytest` | <7.5 | pinned in `requirements.txt` |
 | Verilator (lint only) | 5.026 | `pacman -S mingw-w64-x86_64-verilator` |
@@ -155,8 +155,8 @@ tested here.
 ### Quick install
 
 ```bash
-# 1. install Python deps into your Python 3.7 env
-<your-py37-env>/python.exe -m pip install -r requirements.txt
+# 1. install Python deps into your Python 3.10 env
+<your-py310-env>/python.exe -m pip install -r requirements.txt
 
 # 2. ensure iverilog is on PATH (or note its absolute path; cocotb finds it via PATH)
 iverilog -V
@@ -167,13 +167,13 @@ pacman -S mingw-w64-x86_64-verilator
 
 ### Per-machine configuration
 
-Two paths in `tb/common/cocotb.mk` need to point at your Python 3.7 install.
+Two paths in `tb/common/cocotb.mk` need to point at your Python 3.10 install.
 They have sensible defaults; override either via environment variable or by
 editing the file.
 
 ```make
-PYTHON_BIN          ?= /d/anaconda/envs/py37/python.exe   # MSYS2-style path
-PYTHONHOME_WINPATH  ?= D:/anaconda/envs/py37              # Windows-style path of the same env
+PYTHON_BIN          ?= /d/anaconda/envs/py310/python.exe   # MSYS2-style path
+PYTHONHOME_WINPATH  ?= D:/anaconda/envs/py310              # Windows-style path of the same env
 ```
 
 Why two: `make`'s `$(shell ...)` runs under MSYS2 and needs the `/d/...` form;
@@ -190,21 +190,6 @@ VERILATOR_BIN=/path/to/verilator_bin.exe \
 VERILATOR_ROOT=/path/to/share/verilator \
 bash scripts/lint.sh
 ```
-
-### One known cocotb 1.8.1 patch
-
-`cocotb/share/makefiles/Makefile.inc` (inside the installed cocotb) has one
-line that calls `cocotb-config --python-bin`, which on Windows returns a
-backslash path that MSYS2 `make` mangles. Symptom: 4 lines of
-`Danacondaenvspy37python.exe: command not found` noise during every run.
-Fix once, after every cocotb reinstall:
-
-```diff
-- IS_VENV=$(shell $(shell cocotb-config --python-bin) -c '...')
-+ IS_VENV=$(shell $(PYTHON_BIN) -c '...')
-```
-
-It's harmless if you skip the patch — just noisy.
 
 ## Running the tests
 
@@ -228,7 +213,7 @@ are gitignored.
 tinyNPU/
 ├── plan.md                  Detailed roadmap, architecture, register map, coding rules
 ├── README.md                This file
-├── requirements.txt         cocotb==1.8.1, numpy<1.22, pytest<7.5
+├── requirements.txt         cocotb==1.9.2, numpy<1.22, pytest<7.5
 ├── rtl/                     SystemVerilog sources (15 modules)
 │   ├── pe.sv
 │   ├── systolic_array.sv
@@ -277,4 +262,3 @@ integration runs on every push via
 ## License
 
 Released under the MIT License. See [`LICENSE`](./LICENSE) for the full text.
-

@@ -1,4 +1,4 @@
-// dff.sv — minimal D flip-flop; smoke test for cocotb/Icarus/py37 toolchain.
+// dff.sv — minimal D flip-flop; smoke test for cocotb/Icarus/py310 toolchain.
 // Ports: clk, rst_n (sync active-low), d, q.
 
 module dff (

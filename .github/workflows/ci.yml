@@ -24,10 +24,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq iverilog verilator
 
-      - name: Set up Python 3.7
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.7"
+          python-version: "3.10"
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -42,9 +42,8 @@ jobs:
     # Verilator-based line/toggle coverage. Runs in parallel with regression
     # and is allowed to fail without blocking the merge — the goal here is
     # to produce a coverage report artifact, not to gate on a threshold.
-    # cocotb 1.8.1's Verilator backend needs verilator >= 4.106; ubuntu-22.04
-    # apt only has 4.038 and ubuntu-24.04 has no Python 3.7 available via
-    # actions/setup-python, so build verilator from source on 22.04 and
+    # cocotb's Verilator backend needs verilator >= 4.106; ubuntu-22.04
+    # apt only has 4.038, so build verilator from source on 22.04 and
     # cache the install prefix.
     runs-on: ubuntu-22.04
     continue-on-error: true
@@ -82,10 +81,10 @@ jobs:
       - name: Expose verilator on PATH
         run: echo "${VERILATOR_PREFIX}/bin" >> "$GITHUB_PATH"
 
-      - name: Set up Python 3.7
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.7"
+          python-version: "3.10"
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt

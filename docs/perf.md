@@ -142,12 +142,12 @@ Phase 14 wires the regression and lint scripts into
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Every push
 and pull request runs `scripts/run_all.sh` (every cocotb testbench)
 followed by `scripts/lint.sh` (Verilator strict lint) on an Ubuntu
-runner with Python 3.7 + cocotb 1.8.1 + numpy<1.22 + Icarus 12 +
+runner with Python 3.10 + cocotb 1.9.2 + numpy<1.22 + Icarus 12 +
 Verilator. Failures gate the merge.
 
 ## Coverage
 
-Cocotb 1.8.1 surfaces line/toggle counters when running under
+Cocotb 1.9.2 surfaces line/toggle counters when running under
 `SIM=verilator` rather than Icarus. The regression simulator stays on
 Icarus (faster, no MSYS2 quirks); coverage runs are an opt-in
 secondary path:
@@ -167,9 +167,8 @@ secondary path:
 
 CI runs the script in a separate `coverage` job (see
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) on
-`ubuntu-22.04` with verilator built from source (cocotb 1.8.1 needs
-verilator ≥ 4.106; the apt package on 22.04 is 4.038, and ubuntu-24.04
-has no Python 3.7 available via `actions/setup-python`). The verilator
+`ubuntu-22.04` with verilator built from source (cocotb 1.9.2 needs
+verilator ≥ 4.106; the apt package on 22.04 is 4.038). The verilator
 prefix is cached so subsequent runs skip the ~5 min compile. The job
 is `continue-on-error: true` and uploads `coverage_out/` (merged info
 + HTML) as an artifact — there is no threshold gate; the goal is to

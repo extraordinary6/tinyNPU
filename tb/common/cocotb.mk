@@ -11,7 +11,7 @@
 #                       SIM=verilator (or run `make coverage`) to use the
 #                       Verilator path. Verilator is required for line/toggle
 #                       coverage collection; Icarus has no equivalent.
-#   PYTHON_BIN          path to a Python interpreter with cocotb 1.8.1 installed.
+#   PYTHON_BIN          path to a Python interpreter with cocotb 1.9.x installed.
 #                       Default: python3 on Linux, /d/anaconda/.../python.exe on MSYS2.
 #   PYTHONHOME_WINPATH  (MSYS2 only) Windows-style path of the same env's prefix.
 #                       vvp.exe is a native Windows binary and reads PYTHONHOME from
@@ -24,8 +24,8 @@ ifeq ($(UNAME_S),Linux)
 PYTHON_BIN          ?= python3
 PYTHONHOME_WINPATH  ?=
 else
-PYTHON_BIN          ?= /d/anaconda/envs/py37/python.exe
-PYTHONHOME_WINPATH  ?= D:/anaconda/envs/py37
+PYTHON_BIN          ?= /d/anaconda/envs/py310/python.exe
+PYTHONHOME_WINPATH  ?= D:/anaconda/envs/py310
 endif
 
 export PYTHON_BIN

@@ -1,4 +1,4 @@
-"""Smoke test for the cocotb + Icarus + py37 toolchain.
+"""Smoke test for the cocotb + Icarus + py310 toolchain.
 
 Validates: clock generation, sync reset, 1-cycle flip-flop latency.
 """
